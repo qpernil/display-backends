@@ -12,8 +12,14 @@ mod linux {
         primitives::{Circle, PrimitiveStyle, Rectangle},
         text::{Alignment, Text},
     };
-    use gpiocdev::{line::Value, Request};
-    use std::{error::Error, fs::OpenOptions, os::fd::AsRawFd, time::Instant};
+    use gpiocdev_uapi::v2::{get_line, LineConfig, LineFlags, LineRequest, LineValues, Offsets};
+    use std::{
+        error::Error,
+        fs::{File, OpenOptions},
+        io,
+        os::fd::AsRawFd,
+        time::Instant,
+    };
 
     struct TrezorFramebuffer([u8; SOURCE_FRAMEBUFFER_SIZE]);
 
@@ -70,6 +76,28 @@ mod linux {
         }
     }
 
+    fn request_output_lines(path: &str, offsets: &[u32]) -> io::Result<File> {
+        let chip = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut config = LineConfig {
+            flags: LineFlags::OUTPUT,
+            ..Default::default()
+        };
+        config.add_values(&LineValues::from_slice(&vec![false; offsets.len()]));
+        let request = LineRequest {
+            offsets: Offsets::from_slice(offsets),
+            consumer: "display-backends-demo-control".into(),
+            config,
+            num_lines: offsets.len() as u32,
+            ..Default::default()
+        };
+        get_line(&chip, request).map_err(|error| match error {
+            gpiocdev_uapi::Error::Os(gpiocdev_uapi::Errno(errno)) => {
+                io::Error::from_raw_os_error(errno)
+            }
+            other => io::Error::other(other),
+        })
+    }
+
     fn draw_scene(framebuffer: &mut TrezorFramebuffer, frame: u32) {
         framebuffer.clear(BinaryColor::Off).unwrap();
         Rectangle::new(Point::new(0, 0), Size::new(128, 64))
@@ -122,30 +150,9 @@ mod linux {
         let bus = OpenOptions::new().read(true).write(true).open(bus_path)?;
         let gpio = match backend {
             Backend::Ssd1306I2c => None,
-            Backend::Sh1106I2c => Some(
-                Request::builder()
-                    .on_chip(gpio_path)
-                    .with_consumer("display-backends-demo-control")
-                    .with_lines(&[25])
-                    .as_output(Value::Inactive)
-                    .request()?,
-            ),
-            Backend::Sh1106Spi => Some(
-                Request::builder()
-                    .on_chip(gpio_path)
-                    .with_consumer("display-backends-demo-control")
-                    .with_lines(&[24, 25])
-                    .as_output(Value::Inactive)
-                    .request()?,
-            ),
-            Backend::St7789Spi => Some(
-                Request::builder()
-                    .on_chip(gpio_path)
-                    .with_consumer("display-backends-demo-control")
-                    .with_lines(&[25, 27, 24])
-                    .as_output(Value::Inactive)
-                    .request()?,
-            ),
+            Backend::Sh1106I2c => Some(request_output_lines(gpio_path, &[25])?),
+            Backend::Sh1106Spi => Some(request_output_lines(gpio_path, &[24, 25])?),
+            Backend::St7789Spi => Some(request_output_lines(gpio_path, &[25, 27, 24])?),
         };
         let control_fd = gpio.as_ref().map(AsRawFd::as_raw_fd);
         let mut display = Display::from_raw_fds(backend, bus.as_raw_fd(), control_fd)?;

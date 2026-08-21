@@ -11,7 +11,7 @@ publish = false
 crate-type = ["rlib", "staticlib"]
 
 [features]
-demo = ["dep:embedded-graphics", "dep:gpiocdev"]
+demo = ["dep:embedded-graphics"]
 
 [dependencies]
 libc = "0.2.189"
@@ -20,7 +20,6 @@ libc = "0.2.189"
 gpiocdev-uapi = "0.7.0"
 spidev = "0.7.1"
 embedded-graphics = { version = "0.8.2", optional = true }
-gpiocdev = { version = "0.8.0", optional = true }
 
 [[bin]]
 name = "display-backends-demo"
