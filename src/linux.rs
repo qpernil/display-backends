@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::{
-    encode_mono1_frame, encode_rgb565_frame, st7789_window, Backend, FrameFormat, MONO1_FRAME_SIZE,
-    SH1106_DISPLAY_ON, SH1106_INIT, SSD1306_ADDRESS, SSD1306_INIT, ST7789_FRAMEBUFFER_SIZE,
-    ST7789_INIT, ST7789_PANEL_HEIGHT, ST7789_PANEL_WIDTH,
+    encode_mono1_frame, encode_rgb565_frame, fit_rect, st7789_window, Backend, FrameFormat,
+    MONO1_FRAME_SIZE, SH1106_DISPLAY_ON, SH1106_INIT, SSD1306_ADDRESS, SSD1306_INIT,
+    ST7789_FRAMEBUFFER_SIZE, ST7789_INIT, ST7789_PANEL_HEIGHT, ST7789_PANEL_WIDTH,
 };
 use gpiocdev_uapi::v2::{set_line_values, LineValues};
 use spidev::{SpiModeFlags, Spidev, SpidevOptions};
@@ -135,21 +135,23 @@ impl Display {
                 self.write_oled_frame()
             }
             Backend::St7789Spi => {
-                encode_rgb565_frame(
-                    &mut *self.st7789_frame,
-                    framebuffer,
-                    format,
+                let (x, y, width, height) = fit_rect(
+                    format.width,
+                    format.height,
                     ST7789_PANEL_WIDTH,
                     ST7789_PANEL_HEIGHT,
                 );
-                self.set_st7789_window(
-                    0,
-                    0,
-                    ST7789_PANEL_WIDTH as u16,
-                    ST7789_PANEL_HEIGHT as u16,
-                )?;
+                let frame_length = width * height * 2;
+                encode_rgb565_frame(
+                    &mut self.st7789_frame[..frame_length],
+                    framebuffer,
+                    format,
+                    width,
+                    height,
+                );
+                self.set_st7789_window(x as u16, y as u16, width as u16, height as u16)?;
                 self.set_control(0, true)?;
-                let frame = &*self.st7789_frame;
+                let frame = &self.st7789_frame[..frame_length];
                 match &mut self.bus {
                     Bus::Spi(spi) => write_spi_chunks(spi, frame),
                     Bus::I2c(_) => Err(io::Error::from_raw_os_error(libc::EINVAL)),
