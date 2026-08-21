@@ -21,13 +21,13 @@ enum display_backends_pixel_format {
   /* One bit per pixel, MSB first; page and x byte order are reversed. */
   DISPLAY_BACKENDS_MONO1_MSB_REVERSE_PAGE = 0,
   /* One unsigned grayscale byte per pixel, row-major. */
-  DISPLAY_BACKENDS_GRAY8 = 1,
+  DISPLAY_BACKENDS_MONO8 = 1,
 };
 
 typedef struct DisplayBackendsHandle DisplayBackendsHandle;
 
 /*
- * The source format is fixed for the lifetime of the handle. For Gray8,
+ * The source format is fixed for the lifetime of the handle. For Mono8,
  * stride is bytes per row. For Mono1MsbReversePage, stride is bytes per page.
  * The library duplicates bus_fd and control_fd; ownership remains with caller.
  */

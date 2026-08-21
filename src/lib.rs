@@ -26,7 +26,7 @@ pub const ST7789_FRAMEBUFFER_SIZE: usize = ST7789_PANEL_WIDTH * ST7789_PANEL_HEI
 #[repr(u32)]
 pub enum PixelFormat {
     Mono1MsbReversePage = 0,
-    Gray8 = 1,
+    Mono8 = 1,
 }
 
 impl TryFrom<u32> for PixelFormat {
@@ -35,7 +35,7 @@ impl TryFrom<u32> for PixelFormat {
     fn try_from(value: u32) -> io::Result<Self> {
         match value {
             0 => Ok(Self::Mono1MsbReversePage),
-            1 => Ok(Self::Gray8),
+            1 => Ok(Self::Mono8),
             _ => Err(invalid_argument()),
         }
     }
@@ -86,7 +86,7 @@ impl FrameFormat {
         }
         let rows = match self.pixel_format {
             PixelFormat::Mono1MsbReversePage => self.height.div_ceil(8),
-            PixelFormat::Gray8 => self.height,
+            PixelFormat::Mono8 => self.height,
         };
         self.stride.checked_mul(rows).ok_or_else(invalid_argument)
     }
@@ -104,7 +104,7 @@ impl FrameFormat {
                     0x00
                 }
             }
-            PixelFormat::Gray8 => data[y * self.stride + x],
+            PixelFormat::Mono8 => data[y * self.stride + x],
         }
     }
 }
@@ -424,8 +424,8 @@ mod tests {
     }
 
     #[test]
-    fn gray8_converts_to_rgb565_and_mono1() {
-        let format = FrameFormat::new(PixelFormat::Gray8, 2, 1, 2).unwrap();
+    fn mono8_converts_to_rgb565_and_mono1() {
+        let format = FrameFormat::new(PixelFormat::Mono8, 2, 1, 2).unwrap();
         let source = [0x00, 0x80];
         let mut color = [0_u8; 4];
         encode_rgb565_frame(&mut color, &source, format, 2, 1);
@@ -452,9 +452,9 @@ mod tests {
 
     #[test]
     fn frame_formats_validate_stride_and_length() {
-        assert!(FrameFormat::new(PixelFormat::Gray8, 4, 3, 3).is_err());
+        assert!(FrameFormat::new(PixelFormat::Mono8, 4, 3, 3).is_err());
         assert_eq!(
-            FrameFormat::new(PixelFormat::Gray8, 4, 3, 6)
+            FrameFormat::new(PixelFormat::Mono8, 4, 3, 6)
                 .unwrap()
                 .required_len()
                 .unwrap(),
