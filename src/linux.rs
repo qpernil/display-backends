@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::{
-    encode_st7789_frame, st7789_window, Backend, SH1106_DISPLAY_ON, SH1106_INIT,
-    SOURCE_FRAMEBUFFER_SIZE, SSD1306_ADDRESS, SSD1306_INIT, ST7789_INIT, ST7789_PANEL_HEIGHT,
-    ST7789_PANEL_WIDTH, ST7789_RENDER_BUFFER_SIZE, ST7789_RENDER_HEIGHT, ST7789_RENDER_WIDTH,
-    ST7789_RENDER_X, ST7789_RENDER_Y,
+    encode_mono1_frame, encode_rgb565_frame, fit_rect, st7789_window, Backend, FrameFormat,
+    MONO1_FRAME_SIZE, SH1106_DISPLAY_ON, SH1106_INIT, SSD1306_ADDRESS, SSD1306_INIT,
+    ST7789_FRAMEBUFFER_SIZE, ST7789_INIT, ST7789_PANEL_HEIGHT, ST7789_PANEL_WIDTH,
 };
 use gpiocdev_uapi::v2::{set_line_values, LineValues};
 use spidev::{SpiModeFlags, Spidev, SpidevOptions};
@@ -30,17 +29,22 @@ enum Bus {
 
 pub struct Display {
     backend: Backend,
+    frame_format: FrameFormat,
     bus: Bus,
     control: Option<File>,
-    st7789_frame: Box<[u8; ST7789_RENDER_BUFFER_SIZE]>,
+    st7789_frame: Box<[u8; ST7789_FRAMEBUFFER_SIZE]>,
+    st7789_rect: (usize, usize, usize, usize),
+    mono1_frame: Box<[u8; MONO1_FRAME_SIZE]>,
 }
 
 impl Display {
     pub fn from_raw_fds(
         backend: Backend,
+        frame_format: FrameFormat,
         bus_fd: RawFd,
         control_fd: Option<RawFd>,
     ) -> io::Result<Self> {
+        frame_format.required_len()?;
         let bus_file = duplicate_fd(bus_fd)?;
         let control = match control_fd {
             Some(fd) => Some(duplicate_fd(fd)?),
@@ -80,9 +84,17 @@ impl Display {
 
         let mut display = Self {
             backend,
+            frame_format,
             bus,
             control,
-            st7789_frame: Box::new([0; ST7789_RENDER_BUFFER_SIZE]),
+            st7789_frame: Box::new([0; ST7789_FRAMEBUFFER_SIZE]),
+            st7789_rect: fit_rect(
+                frame_format.width,
+                frame_format.height,
+                ST7789_PANEL_WIDTH,
+                ST7789_PANEL_HEIGHT,
+            ),
+            mono1_frame: Box::new([0; MONO1_FRAME_SIZE]),
         };
         display.initialize()?;
         Ok(display)
@@ -92,39 +104,35 @@ impl Display {
         self.backend
     }
 
-    pub fn write_trezor_frame(
-        &mut self,
-        framebuffer: &[u8; SOURCE_FRAMEBUFFER_SIZE],
-    ) -> io::Result<()> {
+    pub fn frame_format(&self) -> FrameFormat {
+        self.frame_format
+    }
+
+    pub fn write_frame(&mut self, framebuffer: &[u8]) -> io::Result<()> {
+        if framebuffer.len() != self.frame_format.required_len()? {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
         match self.backend {
             Backend::Ssd1306I2c => {
-                self.write_bus(SSD1306_ADDRESS)?;
-                let mut message = [0_u8; SOURCE_FRAMEBUFFER_SIZE + 1];
-                message[0] = 0x40;
-                message[1..].copy_from_slice(framebuffer);
-                self.write_bus(&message)
+                encode_mono1_frame(&mut self.mono1_frame, framebuffer, self.frame_format);
+                self.write_oled_frame()
             }
             Backend::Sh1106I2c | Backend::Sh1106Spi => {
-                for page in 0..8_u8 {
-                    self.write_oled_message(&[0x00, 0xb0 | page, 0x02, 0x10])?;
-                    let mut message = [0_u8; 129];
-                    message[0] = 0x40;
-                    let offset = page as usize * 128;
-                    message[1..].copy_from_slice(&framebuffer[offset..offset + 128]);
-                    self.write_oled_message(&message)?;
-                }
-                Ok(())
+                encode_mono1_frame(&mut self.mono1_frame, framebuffer, self.frame_format);
+                self.write_oled_frame()
             }
             Backend::St7789Spi => {
-                encode_st7789_frame(&mut self.st7789_frame, framebuffer);
-                self.set_st7789_window(
-                    ST7789_RENDER_X as u16,
-                    ST7789_RENDER_Y as u16,
-                    ST7789_RENDER_WIDTH as u16,
-                    ST7789_RENDER_HEIGHT as u16,
-                )?;
+                let (x, y, width, height) = self.st7789_rect;
+                encode_rgb565_frame(
+                    &mut self.st7789_frame[..width * height * 2],
+                    framebuffer,
+                    self.frame_format,
+                    width,
+                    height,
+                );
+                self.set_st7789_window(x as u16, y as u16, width as u16, height as u16)?;
                 self.set_control(0, true)?;
-                let frame: &[u8] = &*self.st7789_frame;
+                let frame = &self.st7789_frame[..width * height * 2];
                 match &mut self.bus {
                     Bus::Spi(spi) => write_spi_chunks(spi, frame),
                     Bus::I2c(_) => Err(io::Error::from_raw_os_error(libc::EINVAL)),
@@ -185,8 +193,27 @@ impl Display {
     }
 
     fn clear_oled(&mut self) -> io::Result<()> {
-        let blank = [0_u8; SOURCE_FRAMEBUFFER_SIZE];
-        self.write_trezor_frame(&blank)
+        self.mono1_frame.fill(0);
+        self.write_oled_frame()
+    }
+
+    fn write_oled_frame(&mut self) -> io::Result<()> {
+        if self.backend == Backend::Ssd1306I2c {
+            self.write_bus(SSD1306_ADDRESS)?;
+            let mut message = [0_u8; MONO1_FRAME_SIZE + 1];
+            message[0] = 0x40;
+            message[1..].copy_from_slice(&*self.mono1_frame);
+            return self.write_bus(&message);
+        }
+        for page in 0..8_u8 {
+            self.write_oled_message(&[0x00, 0xb0 | page, 0x02, 0x10])?;
+            let mut message = [0_u8; 129];
+            message[0] = 0x40;
+            let offset = page as usize * 128;
+            message[1..].copy_from_slice(&self.mono1_frame[offset..offset + 128]);
+            self.write_oled_message(&message)?;
+        }
+        Ok(())
     }
 
     fn clear_st7789(&mut self) -> io::Result<()> {

@@ -3,7 +3,8 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use display_backends::{
-        set_source_pixel, Backend, Display, SOURCE_FRAMEBUFFER_SIZE, SOURCE_HEIGHT, SOURCE_WIDTH,
+        set_mono1_pixel, Backend, Display, FrameFormat, MONO1_FRAME_HEIGHT, MONO1_FRAME_SIZE,
+        MONO1_FRAME_WIDTH,
     };
     use embedded_graphics::{
         mono_font::{ascii::FONT_10X20, ascii::FONT_6X10, MonoTextStyle},
@@ -21,25 +22,25 @@ mod linux {
         time::Instant,
     };
 
-    struct TrezorFramebuffer([u8; SOURCE_FRAMEBUFFER_SIZE]);
+    struct DemoFramebuffer([u8; MONO1_FRAME_SIZE]);
 
-    impl TrezorFramebuffer {
+    impl DemoFramebuffer {
         fn new() -> Self {
-            Self([0; SOURCE_FRAMEBUFFER_SIZE])
+            Self([0; MONO1_FRAME_SIZE])
         }
 
-        fn bytes(&self) -> &[u8; SOURCE_FRAMEBUFFER_SIZE] {
+        fn bytes(&self) -> &[u8; MONO1_FRAME_SIZE] {
             &self.0
         }
     }
 
-    impl OriginDimensions for TrezorFramebuffer {
+    impl OriginDimensions for DemoFramebuffer {
         fn size(&self) -> Size {
-            Size::new(SOURCE_WIDTH as u32, SOURCE_HEIGHT as u32)
+            Size::new(MONO1_FRAME_WIDTH as u32, MONO1_FRAME_HEIGHT as u32)
         }
     }
 
-    impl DrawTarget for TrezorFramebuffer {
+    impl DrawTarget for DemoFramebuffer {
         type Color = BinaryColor;
         type Error = core::convert::Infallible;
 
@@ -49,8 +50,9 @@ mod linux {
         {
             for Pixel(point, color) in pixels {
                 if point.x >= 0 && point.y >= 0 {
-                    set_source_pixel(
+                    set_mono1_pixel(
                         &mut self.0,
+                        FrameFormat::mono1_128x64(),
                         point.x as usize,
                         point.y as usize,
                         color == BinaryColor::On,
@@ -98,7 +100,7 @@ mod linux {
         })
     }
 
-    fn draw_scene(framebuffer: &mut TrezorFramebuffer, frame: u32) {
+    fn draw_scene(framebuffer: &mut DemoFramebuffer, frame: u32) {
         framebuffer.clear(BinaryColor::Off).unwrap();
         Rectangle::new(Point::new(0, 0), Size::new(128, 64))
             .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
@@ -155,12 +157,17 @@ mod linux {
             Backend::St7789Spi => Some(request_output_lines(gpio_path, &[25, 27, 24])?),
         };
         let control_fd = gpio.as_ref().map(AsRawFd::as_raw_fd);
-        let mut display = Display::from_raw_fds(backend, bus.as_raw_fd(), control_fd)?;
-        let mut framebuffer = TrezorFramebuffer::new();
+        let mut display = Display::from_raw_fds(
+            backend,
+            FrameFormat::mono1_128x64(),
+            bus.as_raw_fd(),
+            control_fd,
+        )?;
+        let mut framebuffer = DemoFramebuffer::new();
         let start = Instant::now();
         for frame in 0..240 {
             draw_scene(&mut framebuffer, frame);
-            display.write_trezor_frame(framebuffer.bytes())?;
+            display.write_frame(framebuffer.bytes())?;
         }
         let elapsed = start.elapsed();
         println!(

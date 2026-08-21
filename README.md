@@ -1,8 +1,22 @@
 # Display Backends
 
-`display-backends` translates the 128x64 one-bit framebuffer used by Trezor
-One firmware into traffic for physical displays attached to Linux. It supports
-SSD1306 over I2C, SH1106 over I2C or SPI, and ST7789 over SPI.
+`display-backends` translates application framebuffers into traffic for
+physical displays attached to Linux. It supports SSD1306 over I2C, SH1106 over
+I2C or SPI, and ST7789 over SPI.
+
+Source pixels and physical controllers are independent. A display handle is
+created with one fixed source format, width, height, and stride. The supported
+source formats are:
+
+| Format | Layout |
+| --- | --- |
+| `Mono1MsbReversePage` | One bit per pixel, MSB first, with page and x-byte order reversed |
+| `Gray8` | One unsigned grayscale byte per pixel, row-major |
+
+Every controller accepts both formats. Frames are scaled with preserved aspect
+ratio and centered. SSD1306 and SH1106 threshold Gray8 at 128 into their native
+1-bit pages. ST7789 converts Gray8 to RGB565; one-bit pixels become black or
+white RGB565 pixels.
 
 The library never opens hardware paths. Its Rust and C APIs accept already-open
 bus descriptors and exact GPIO line-request descriptors. It duplicates those
@@ -20,7 +34,13 @@ cargo fmt --check
 ```
 
 The C ABI is declared in `include/display_backends.h`; Linux builds produce
-`target/release/libdisplay_backends.a`.
+`target/release/libdisplay_backends.a`. The API is device-neutral:
+
+```c
+display_backends_create(backend, pixel_format, width, height, stride,
+                        bus_fd, control_fd, &handle);
+display_backends_write_frame(handle, bytes, length);
+```
 
 `virtual-trezor` expects this repository and its own checkout to be sibling
 directories. Set `DISPLAY_BACKENDS_DIR` when using another layout.
