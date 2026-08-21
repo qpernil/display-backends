@@ -2,10 +2,13 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use display_backends::{Backend, Display, FrameFormat, PixelFormat};
+    use display_backends::{
+        set_mono1_pixel, Backend, Display, FrameFormat, MONO1_FRAME_HEIGHT, MONO1_FRAME_SIZE,
+        MONO1_FRAME_WIDTH, ST7789_FRAMEBUFFER_SIZE, ST7789_PANEL_HEIGHT, ST7789_PANEL_WIDTH,
+    };
     use embedded_graphics::{
         mono_font::{ascii::FONT_10X20, ascii::FONT_6X10, MonoTextStyle},
-        pixelcolor::Gray8,
+        pixelcolor::{BinaryColor, Rgb565},
         prelude::*,
         primitives::{Circle, PrimitiveStyle, Rectangle},
         text::{Alignment, Text},
@@ -19,35 +22,72 @@ mod linux {
         time::Instant,
     };
 
-    const FRAME_WIDTH: usize = 128;
-    const FRAME_HEIGHT: usize = 64;
-    const FRAME_SIZE: usize = FRAME_WIDTH * FRAME_HEIGHT;
+    struct MonoFramebuffer([u8; MONO1_FRAME_SIZE]);
 
-    fn frame_format() -> FrameFormat {
-        FrameFormat::new(PixelFormat::Mono8, FRAME_WIDTH, FRAME_HEIGHT, FRAME_WIDTH)
-            .expect("the fixed demo frame format is valid")
-    }
-
-    struct DemoFramebuffer([u8; FRAME_SIZE]);
-
-    impl DemoFramebuffer {
+    impl MonoFramebuffer {
         fn new() -> Self {
-            Self([0; FRAME_SIZE])
+            Self([0; MONO1_FRAME_SIZE])
         }
 
-        fn bytes(&self) -> &[u8; FRAME_SIZE] {
+        fn bytes(&self) -> &[u8; MONO1_FRAME_SIZE] {
             &self.0
         }
     }
 
-    impl OriginDimensions for DemoFramebuffer {
+    impl OriginDimensions for MonoFramebuffer {
         fn size(&self) -> Size {
-            Size::new(FRAME_WIDTH as u32, FRAME_HEIGHT as u32)
+            Size::new(MONO1_FRAME_WIDTH as u32, MONO1_FRAME_HEIGHT as u32)
         }
     }
 
-    impl DrawTarget for DemoFramebuffer {
-        type Color = Gray8;
+    impl DrawTarget for MonoFramebuffer {
+        type Color = BinaryColor;
+        type Error = core::convert::Infallible;
+
+        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+            I: IntoIterator<Item = Pixel<Self::Color>>,
+        {
+            for Pixel(point, color) in pixels {
+                if point.x >= 0 && point.y >= 0 {
+                    set_mono1_pixel(
+                        &mut self.0,
+                        FrameFormat::mono1_128x64(),
+                        point.x as usize,
+                        point.y as usize,
+                        color == BinaryColor::On,
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
+            self.0.fill(if color == BinaryColor::On { 0xff } else { 0 });
+            Ok(())
+        }
+    }
+
+    struct ColorFramebuffer(Vec<u8>);
+
+    impl ColorFramebuffer {
+        fn new() -> Self {
+            Self(vec![0; ST7789_FRAMEBUFFER_SIZE])
+        }
+
+        fn bytes(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    impl OriginDimensions for ColorFramebuffer {
+        fn size(&self) -> Size {
+            Size::new(ST7789_PANEL_WIDTH as u32, ST7789_PANEL_HEIGHT as u32)
+        }
+    }
+
+    impl DrawTarget for ColorFramebuffer {
+        type Color = Rgb565;
         type Error = core::convert::Infallible;
 
         fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
@@ -57,17 +97,21 @@ mod linux {
             for Pixel(point, color) in pixels {
                 if point.x >= 0
                     && point.y >= 0
-                    && point.x < FRAME_WIDTH as i32
-                    && point.y < FRAME_HEIGHT as i32
+                    && point.x < ST7789_PANEL_WIDTH as i32
+                    && point.y < ST7789_PANEL_HEIGHT as i32
                 {
-                    self.0[point.y as usize * FRAME_WIDTH + point.x as usize] = color.luma();
+                    let offset = (point.y as usize * ST7789_PANEL_WIDTH + point.x as usize) * 2;
+                    self.0[offset..offset + 2].copy_from_slice(&color.into_storage().to_be_bytes());
                 }
             }
             Ok(())
         }
 
         fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
-            self.0.fill(color.luma());
+            let pixel = color.into_storage().to_be_bytes();
+            for destination in self.0.chunks_exact_mut(2) {
+                destination.copy_from_slice(&pixel);
+            }
             Ok(())
         }
     }
@@ -104,16 +148,16 @@ mod linux {
         })
     }
 
-    fn draw_scene(framebuffer: &mut DemoFramebuffer, frame: u32) {
-        framebuffer.clear(Gray8::new(0)).unwrap();
+    fn draw_mono_scene(framebuffer: &mut MonoFramebuffer, frame: u32) {
+        framebuffer.clear(BinaryColor::Off).unwrap();
         Rectangle::new(Point::new(0, 0), Size::new(128, 64))
-            .into_styled(PrimitiveStyle::with_stroke(Gray8::new(255), 1))
+            .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
             .draw(framebuffer)
             .unwrap();
         Text::with_alignment(
             "RUST DISPLAY",
             Point::new(64, 17),
-            MonoTextStyle::new(&FONT_6X10, Gray8::new(160)),
+            MonoTextStyle::new(&FONT_6X10, BinaryColor::On),
             Alignment::Center,
         )
         .draw(framebuffer)
@@ -121,16 +165,59 @@ mod linux {
         Text::with_alignment(
             "BACKENDS",
             Point::new(64, 38),
-            MonoTextStyle::new(&FONT_10X20, Gray8::new(255)),
+            MonoTextStyle::new(&FONT_10X20, BinaryColor::On),
             Alignment::Center,
         )
         .draw(framebuffer)
         .unwrap();
         let x = 8 + (frame % 108) as i32;
         Circle::new(Point::new(x, 49), 8)
-            .into_styled(PrimitiveStyle::with_fill(Gray8::new(
-                128 + (frame % 128) as u8,
+            .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+            .draw(framebuffer)
+            .unwrap();
+    }
+
+    fn draw_color_scene(framebuffer: &mut ColorFramebuffer, frame: u32) {
+        let navy = Rgb565::new(0, 4, 10);
+        let cyan = Rgb565::new(0, 52, 31);
+        let yellow = Rgb565::new(31, 52, 0);
+        let white = Rgb565::new(31, 63, 31);
+        framebuffer.clear(navy).unwrap();
+        Rectangle::new(Point::new(4, 4), Size::new(232, 232))
+            .into_styled(PrimitiveStyle::with_stroke(cyan, 3))
+            .draw(framebuffer)
+            .unwrap();
+        Text::with_alignment(
+            "DISPLAY BACKENDS",
+            Point::new(120, 38),
+            MonoTextStyle::new(&FONT_10X20, white),
+            Alignment::Center,
+        )
+        .draw(framebuffer)
+        .unwrap();
+        Text::with_alignment(
+            "NATIVE RGB565",
+            Point::new(120, 68),
+            MonoTextStyle::new(&FONT_6X10, yellow),
+            Alignment::Center,
+        )
+        .draw(framebuffer)
+        .unwrap();
+        let x = 18 + (frame % 174) as i32;
+        Circle::new(Point::new(x, 100), 44)
+            .into_styled(PrimitiveStyle::with_fill(Rgb565::new(
+                (frame % 32) as u8,
+                42,
+                31 - (frame % 32) as u8,
             )))
+            .draw(framebuffer)
+            .unwrap();
+        Rectangle::new(Point::new(20, 180), Size::new(200, 24))
+            .into_styled(PrimitiveStyle::with_stroke(white, 2))
+            .draw(framebuffer)
+            .unwrap();
+        Rectangle::new(Point::new(24, 184), Size::new((frame % 193) + 1, 16))
+            .into_styled(PrimitiveStyle::with_fill(yellow))
             .draw(framebuffer)
             .unwrap();
     }
@@ -163,17 +250,24 @@ mod linux {
             Backend::St7789Spi => Some(request_output_lines(gpio_path, &[25, 27, 24])?),
         };
         let control_fd = gpio.as_ref().map(AsRawFd::as_raw_fd);
-        let mut display =
-            Display::from_raw_fds(backend, frame_format(), bus.as_raw_fd(), control_fd)?;
-        let mut framebuffer = DemoFramebuffer::new();
+        let mut display = Display::from_raw_fds(backend, bus.as_raw_fd(), control_fd)?;
         let start = Instant::now();
-        for frame in 0..240 {
-            draw_scene(&mut framebuffer, frame);
-            display.write_frame(framebuffer.bytes())?;
+        if backend == Backend::St7789Spi {
+            let mut framebuffer = ColorFramebuffer::new();
+            for frame in 0..240 {
+                draw_color_scene(&mut framebuffer, frame);
+                display.write_native_frame(framebuffer.bytes())?;
+            }
+        } else {
+            let mut framebuffer = MonoFramebuffer::new();
+            for frame in 0..240 {
+                draw_mono_scene(&mut framebuffer, frame);
+                display.write_native_frame(framebuffer.bytes())?;
+            }
         }
         let elapsed = start.elapsed();
         println!(
-            "Rendered 240 frames through {} in {:.2}s ({:.1} frames/s)",
+            "Composed and sent 240 native frames through {} in {:.2}s ({:.1} frames/s)",
             backend.name(),
             elapsed.as_secs_f64(),
             240.0 / elapsed.as_secs_f64()

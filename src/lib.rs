@@ -27,6 +27,7 @@ pub const ST7789_FRAMEBUFFER_SIZE: usize = ST7789_PANEL_WIDTH * ST7789_PANEL_HEI
 pub enum PixelFormat {
     Mono1MsbReversePage = 0,
     Mono8 = 1,
+    Rgb565Be = 2,
 }
 
 impl TryFrom<u32> for PixelFormat {
@@ -36,6 +37,7 @@ impl TryFrom<u32> for PixelFormat {
         match value {
             0 => Ok(Self::Mono1MsbReversePage),
             1 => Ok(Self::Mono8),
+            2 => Ok(Self::Rgb565Be),
             _ => Err(invalid_argument()),
         }
     }
@@ -75,18 +77,31 @@ impl FrameFormat {
         }
     }
 
+    pub fn rgb565_240x240() -> Self {
+        Self {
+            pixel_format: PixelFormat::Rgb565Be,
+            width: ST7789_PANEL_WIDTH,
+            height: ST7789_PANEL_HEIGHT,
+            stride: ST7789_PANEL_WIDTH * 2,
+        }
+    }
+
     pub fn required_len(self) -> io::Result<usize> {
+        let minimum_stride = match self.pixel_format {
+            PixelFormat::Mono1MsbReversePage | PixelFormat::Mono8 => self.width,
+            PixelFormat::Rgb565Be => self.width.checked_mul(2).ok_or_else(invalid_argument)?,
+        };
         if self.width == 0
             || self.height == 0
             || self.width > u16::MAX as usize
             || self.height > u16::MAX as usize
-            || self.stride < self.width
+            || self.stride < minimum_stride
         {
             return Err(invalid_argument());
         }
         let rows = match self.pixel_format {
             PixelFormat::Mono1MsbReversePage => self.height.div_ceil(8),
-            PixelFormat::Mono8 => self.height,
+            PixelFormat::Mono8 | PixelFormat::Rgb565Be => self.height,
         };
         self.stride.checked_mul(rows).ok_or_else(invalid_argument)
     }
@@ -105,6 +120,27 @@ impl FrameFormat {
                 }
             }
             PixelFormat::Mono8 => data[y * self.stride + x],
+            PixelFormat::Rgb565Be => {
+                let offset = y * self.stride + x * 2;
+                let pixel = u16::from_be_bytes([data[offset], data[offset + 1]]);
+                let red = ((pixel >> 11) & 0x1f) * 255 / 31;
+                let green = ((pixel >> 5) & 0x3f) * 255 / 63;
+                let blue = (pixel & 0x1f) * 255 / 31;
+                ((red * 77 + green * 150 + blue * 29) >> 8) as u8
+            }
+        }
+    }
+
+    pub fn rgb565(self, data: &[u8], x: usize, y: usize) -> u16 {
+        match self.pixel_format {
+            PixelFormat::Rgb565Be => {
+                let offset = y * self.stride + x * 2;
+                u16::from_be_bytes([data[offset], data[offset + 1]])
+            }
+            PixelFormat::Mono1MsbReversePage | PixelFormat::Mono8 => {
+                let gray = u16::from(self.intensity(data, x, y));
+                ((gray >> 3) << 11) | ((gray >> 2) << 5) | (gray >> 3)
+            }
         }
     }
 }
@@ -142,6 +178,13 @@ impl Backend {
             Self::Sh1106I2c => 1,
             Self::Sh1106Spi => 2,
             Self::St7789Spi => 3,
+        }
+    }
+
+    pub fn native_format(self) -> FrameFormat {
+        match self {
+            Self::Ssd1306I2c | Self::Sh1106I2c | Self::Sh1106Spi => FrameFormat::mono1_128x64(),
+            Self::St7789Spi => FrameFormat::rgb565_240x240(),
         }
     }
 }
@@ -321,18 +364,17 @@ pub fn encode_rgb565_frame(
     render_width: usize,
     render_height: usize,
 ) {
-    let mut output = 0;
-    for y in 0..render_height {
-        let source_y = y * format.height / render_height;
-        for x in 0..render_width {
-            let source_x = x * format.width / render_width;
-            let gray = format.intensity(source, source_x, source_y);
-            let rgb565 = ((u16::from(gray) >> 3) << 11)
-                | ((u16::from(gray) >> 2) << 5)
-                | (u16::from(gray) >> 3);
+    destination.fill(0);
+    let (offset_x, offset_y, width, height) =
+        fit_rect(format.width, format.height, render_width, render_height);
+    for y in 0..height {
+        let source_y = y * format.height / height;
+        for x in 0..width {
+            let source_x = x * format.width / width;
+            let rgb565 = format.rgb565(source, source_x, source_y);
+            let output = ((offset_y + y) * render_width + offset_x + x) * 2;
             destination[output] = (rgb565 >> 8) as u8;
             destination[output + 1] = rgb565 as u8;
-            output += 2;
         }
     }
 }
@@ -386,6 +428,14 @@ mod tests {
         assert_eq!(Backend::Sh1106Spi.control_line_count(), 2);
         assert_eq!(Backend::St7789Spi.control_line_count(), 3);
         assert!(Backend::St7789Spi.uses_spi());
+        assert_eq!(
+            Backend::Ssd1306I2c.native_format(),
+            FrameFormat::mono1_128x64()
+        );
+        assert_eq!(
+            Backend::St7789Spi.native_format(),
+            FrameFormat::rgb565_240x240()
+        );
     }
 
     #[test]
@@ -439,6 +489,22 @@ mod tests {
     }
 
     #[test]
+    fn native_rgb565_conversion_is_byte_exact() {
+        let format = FrameFormat::new(PixelFormat::Rgb565Be, 2, 1, 4).unwrap();
+        let source = [0xf8, 0x00, 0x00, 0x1f];
+        let mut output = [0_u8; 4];
+        encode_rgb565_frame(&mut output, &source, format, 2, 1);
+        assert_eq!(output, source);
+
+        let mut mono = [0_u8; MONO1_FRAME_SIZE];
+        let grayscale = [0xff, 0xff, 0x00, 0x00];
+        encode_mono1_frame(&mut mono, &grayscale, format);
+        let target = FrameFormat::mono1_128x64();
+        assert_eq!(target.intensity(&mono, 0, 0), 0xff);
+        assert_eq!(target.intensity(&mono, 127, 0), 0x00);
+    }
+
+    #[test]
     fn native_mono1_conversion_is_byte_exact() {
         let format = FrameFormat::mono1_128x64();
         let mut source = [0_u8; MONO1_FRAME_SIZE];
@@ -466,6 +532,14 @@ mod tests {
                 .required_len()
                 .unwrap(),
             8
+        );
+        assert!(FrameFormat::new(PixelFormat::Rgb565Be, 4, 3, 7).is_err());
+        assert_eq!(
+            FrameFormat::new(PixelFormat::Rgb565Be, 4, 3, 10)
+                .unwrap()
+                .required_len()
+                .unwrap(),
+            30
         );
     }
 

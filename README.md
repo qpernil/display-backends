@@ -4,19 +4,28 @@
 physical displays attached to Linux. It supports SSD1306 over I2C, SH1106 over
 I2C or SPI, and ST7789 over SPI.
 
-Source pixels and physical controllers are independent. A display handle is
-created with one fixed source format, width, height, and stride. The supported
-source formats are:
+The API has two layers. `write_native_frame` sends pixels already composed in
+the controller's native format, with no scaling or pixel conversion:
+
+| Controller | Native frame |
+| --- | --- |
+| SSD1306 / SH1106 | 128x64 `Mono1MsbReversePage` |
+| ST7789 | 240x240 `Rgb565Be` |
+
+The optional `write_frame` conversion layer accepts a producer format, width,
+height, and stride, then aspect-fits and centers it in the native frame. The
+supported producer formats are:
 
 | Format | Layout |
 | --- | --- |
 | `Mono1MsbReversePage` | One bit per pixel, MSB first, with page and x-byte order reversed |
 | `Mono8` | One unsigned monochrome-intensity byte per pixel, row-major |
+| `Rgb565Be` | Two-byte RGB565 pixels, most significant byte first, row-major |
 
-Every controller accepts both formats. Frames are scaled with preserved aspect
-ratio and centered. SSD1306 and SH1106 threshold Mono8 at 128 into their native
-1-bit pages. ST7789 converts Mono8 to RGB565 grayscale; one-bit pixels become black or
-white RGB565 pixels.
+Every controller accepts all three formats through the conversion layer.
+SSD1306 and SH1106 threshold intensity at 128 into native 1-bit pages. ST7789
+maps monochrome intensity to RGB565 grayscale. Native frames bypass all of that
+work.
 
 The library never opens hardware paths. Its Rust and C APIs accept already-open
 bus descriptors and exact GPIO line-request descriptors. It duplicates those
@@ -37,9 +46,10 @@ The C ABI is declared in `include/display_backends.h`; Linux builds produce
 `target/release/libdisplay_backends.a`. The API is device-neutral:
 
 ```c
-display_backends_create(backend, pixel_format, width, height, stride,
-                        bus_fd, control_fd, &handle);
-display_backends_write_frame(handle, bytes, length);
+display_backends_create(backend, bus_fd, control_fd, &handle);
+display_backends_write_native_frame(handle, native_bytes, native_length);
+display_backends_write_frame(handle, pixel_format, width, height, stride,
+                             producer_bytes, producer_length);
 ```
 
 `virtual-trezor` expects this repository and its own checkout to be sibling
@@ -47,10 +57,11 @@ directories. Set `DISPLAY_BACKENDS_DIR` when using another layout.
 
 ## Hardware demo
 
-The demo uses `embedded-graphics` to compose a native Mono8 framebuffer, then
-passes it through the same conversion, controller initialization, and
-bus-writing code as library consumers. It alone opens hardware paths so it can
-be run directly for diagnostics.
+The demo uses `embedded-graphics` to compose directly in each controller's
+native format: full-color RGB565 for ST7789 and packed 1-bit pixels for the
+monochrome OLEDs. It therefore tests the native transport layer without an
+intermediate conversion. It alone opens hardware paths so it can be run
+directly for diagnostics.
 
 Stop any service that owns the display, then select a backend:
 
@@ -78,7 +89,8 @@ before clearing and releasing the display.
 
 ## Ownership boundary
 
-The library owns display protocol and encoding mechanics: controller setup,
-reset/D/C/backlight operations, SPI/I2C writes, frame conversion, clearing, and
-display-off. Its caller owns resource discovery, process lifecycle, retry
+The library owns native display mechanics—controller setup,
+reset/D/C/backlight operations, SPI/I2C writes, clearing, and display-off—and
+an optional producer-to-native conversion layer. Composition remains in the
+caller. Its caller also owns resource discovery, process lifecycle, retry
 policy, and logging.

@@ -15,10 +15,6 @@ fn error_code(error: &io::Error) -> libc::c_int {
 #[no_mangle]
 pub unsafe extern "C" fn display_backends_create(
     backend: u32,
-    pixel_format: u32,
-    width: usize,
-    height: usize,
-    stride: usize,
     bus_fd: RawFd,
     control_fd: RawFd,
     output: *mut *mut DisplayBackendsHandle,
@@ -31,16 +27,8 @@ pub unsafe extern "C" fn display_backends_create(
         Ok(backend) => backend,
         Err(error) => return error_code(&error),
     };
-    let pixel_format = match PixelFormat::try_from(pixel_format) {
-        Ok(pixel_format) => pixel_format,
-        Err(error) => return error_code(&error),
-    };
-    let frame_format = match FrameFormat::new(pixel_format, width, height, stride) {
-        Ok(frame_format) => frame_format,
-        Err(error) => return error_code(&error),
-    };
     let control = (backend.control_line_count() != 0).then_some(control_fd);
-    match Display::from_raw_fds(backend, frame_format, bus_fd, control) {
+    match Display::from_raw_fds(backend, bus_fd, control) {
         Ok(display) => {
             let handle = Box::new(DisplayBackendsHandle { display });
             unsafe { *output = Box::into_raw(handle) };
@@ -53,13 +41,25 @@ pub unsafe extern "C" fn display_backends_create(
 #[no_mangle]
 pub unsafe extern "C" fn display_backends_write_frame(
     handle: *mut DisplayBackendsHandle,
+    pixel_format: u32,
+    width: usize,
+    height: usize,
+    stride: usize,
     framebuffer: *const u8,
     length: usize,
 ) -> libc::c_int {
     if handle.is_null() || framebuffer.is_null() {
         return libc::EINVAL;
     }
-    let expected = match unsafe { &*handle }.display.frame_format().required_len() {
+    let pixel_format = match PixelFormat::try_from(pixel_format) {
+        Ok(pixel_format) => pixel_format,
+        Err(error) => return error_code(&error),
+    };
+    let format = match FrameFormat::new(pixel_format, width, height, stride) {
+        Ok(format) => format,
+        Err(error) => return error_code(&error),
+    };
+    let expected = match format.required_len() {
         Ok(expected) => expected,
         Err(error) => return error_code(&error),
     };
@@ -67,7 +67,30 @@ pub unsafe extern "C" fn display_backends_write_frame(
         return libc::EINVAL;
     }
     let bytes = unsafe { slice::from_raw_parts(framebuffer, length) };
-    match unsafe { &mut *handle }.display.write_frame(bytes) {
+    match unsafe { &mut *handle }.display.write_frame(bytes, format) {
+        Ok(()) => 0,
+        Err(error) => error_code(&error),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn display_backends_write_native_frame(
+    handle: *mut DisplayBackendsHandle,
+    framebuffer: *const u8,
+    length: usize,
+) -> libc::c_int {
+    if handle.is_null() || framebuffer.is_null() {
+        return libc::EINVAL;
+    }
+    let expected = match unsafe { &*handle }.display.native_format().required_len() {
+        Ok(expected) => expected,
+        Err(error) => return error_code(&error),
+    };
+    if length != expected {
+        return libc::EINVAL;
+    }
+    let bytes = unsafe { slice::from_raw_parts(framebuffer, length) };
+    match unsafe { &mut *handle }.display.write_native_frame(bytes) {
         Ok(()) => 0,
         Err(error) => error_code(&error),
     }
