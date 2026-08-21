@@ -43,6 +43,7 @@ name = "display-backends"
 version = "0.1.0"
 dependencies = [
  "embedded-graphics",
+ "gpiocdev",
  "gpiocdev-uapi",
  "libc",
  "spidev",
@@ -78,6 +79,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "gpiocdev"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a6009ef6766dd62a7f5933d379d357ae89eaee4e9c2455b6596f359627660a1"
+dependencies = [
+ "gpiocdev-uapi",
+ "thiserror",
 ]
 
 [[package]]

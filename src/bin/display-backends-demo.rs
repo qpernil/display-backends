@@ -13,10 +13,10 @@ mod linux {
         primitives::{Circle, PrimitiveStyle, Rectangle},
         text::{Alignment, Text},
     };
-    use gpiocdev_uapi::v2::{get_line, LineConfig, LineFlags, LineRequest, LineValues, Offsets};
+    use gpiocdev::{line::Value, Request};
     use std::{
         error::Error,
-        fs::{File, OpenOptions},
+        fs::OpenOptions,
         io,
         os::fd::AsRawFd,
         time::Instant,
@@ -126,26 +126,14 @@ mod linux {
         }
     }
 
-    fn request_output_lines(path: &str, offsets: &[u32]) -> io::Result<File> {
-        let chip = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut config = LineConfig {
-            flags: LineFlags::OUTPUT,
-            ..Default::default()
-        };
-        config.add_values(&LineValues::from_slice(&vec![false; offsets.len()]));
-        let request = LineRequest {
-            offsets: Offsets::from_slice(offsets),
-            consumer: "display-backends-demo-control".into(),
-            config,
-            num_lines: offsets.len() as u32,
-            ..Default::default()
-        };
-        get_line(&chip, request).map_err(|error| match error {
-            gpiocdev_uapi::Error::Os(gpiocdev_uapi::Errno(errno)) => {
-                io::Error::from_raw_os_error(errno)
-            }
-            other => io::Error::other(other),
-        })
+    fn request_output_lines(path: &str, offsets: &[u32]) -> io::Result<Request> {
+        Request::builder()
+            .on_chip(path)
+            .with_consumer("display-backends-demo-control")
+            .with_lines(offsets)
+            .as_output(Value::Inactive)
+            .request()
+            .map_err(io::Error::other)
     }
 
     fn draw_mono_scene(framebuffer: &mut MonoFramebuffer, frame: u32) {
