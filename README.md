@@ -43,7 +43,11 @@ cargo fmt --check
 ```
 
 The C ABI is declared in `include/display_backends.h`; Linux builds produce
-`target/release/libdisplay_backends.a`. The API is device-neutral:
+both `target/release/libdisplay_backends.a` and
+`target/release/libdisplay_backends.so`. Native workers without another Rust
+runtime can use the static archive. Firmware emulators that already embed a
+Rust runtime use the shared library so panic/runtime symbols remain isolated.
+The API is device-neutral:
 
 ```c
 display_backends_create(backend, bus_fd, control_fd, &handle);

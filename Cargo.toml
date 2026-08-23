@@ -8,7 +8,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [lib]
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [features]
 demo = ["dep:embedded-graphics"]
