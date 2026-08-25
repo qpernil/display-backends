@@ -250,6 +250,7 @@ struct Engine<R> {
     seen_epoch: u64,
     pending_activity_edge: bool,
     pending_activity_pulse: bool,
+    pending_completion_edge: bool,
     attention: Option<Cadence>,
     mode: Mode,
     deadline: Option<Instant>,
@@ -267,6 +268,7 @@ impl<R: IndicatorRenderer> Engine<R> {
             seen_epoch: 0,
             pending_activity_edge: false,
             pending_activity_pulse: false,
+            pending_completion_edge: false,
             attention: None,
             mode: Mode::Rest,
             deadline: None,
@@ -278,6 +280,7 @@ impl<R: IndicatorRenderer> Engine<R> {
         self.enabled = enabled;
         self.pending_activity_edge = false;
         self.pending_activity_pulse = false;
+        self.pending_completion_edge = false;
         self.attention = None;
         self.mode = Mode::Rest;
         self.deadline = None;
@@ -310,6 +313,9 @@ impl<R: IndicatorRenderer> Engine<R> {
             if commands_started > 1 {
                 self.pending_activity_pulse = true;
             }
+            if !active && matches!(self.policy.idle, IdlePolicy::Periodic(_)) {
+                self.pending_completion_edge = true;
+            }
             return self.drive_due(now);
         }
         if active {
@@ -318,6 +324,9 @@ impl<R: IndicatorRenderer> Engine<R> {
                 self.deadline = Some(now + self.policy.busy.delay(self.lit));
             }
         } else if was_active {
+            if matches!(self.policy.idle, IdlePolicy::Periodic(_)) {
+                self.pending_completion_edge = true;
+            }
             self.start_idle_after_activity(now)?;
         }
         Ok(())
@@ -327,6 +336,7 @@ impl<R: IndicatorRenderer> Engine<R> {
         self.attention = Some(cadence);
         self.pending_activity_edge = false;
         self.pending_activity_pulse = false;
+        self.pending_completion_edge = false;
         if !self.enabled {
             return Ok(());
         }
@@ -445,8 +455,18 @@ impl<R: IndicatorRenderer> Engine<R> {
     }
 
     fn start_idle_after_activity(&mut self, now: Instant) -> io::Result<()> {
+        if self.pending_completion_edge {
+            self.pending_completion_edge = false;
+            self.pending_activity_edge = true;
+            self.deadline = Some(self.edge_ready(now));
+            self.drive_due(now)?;
+            return Ok(());
+        }
+
         if self.pending_activity_pulse {
-            if self.lit {
+            if matches!(self.policy.idle, IdlePolicy::Periodic(_)) {
+                self.start_pending_pulse(now)?;
+            } else if self.lit {
                 self.mode = Mode::SettleOff;
                 self.deadline = Some(self.edge_ready(now));
                 self.drive_due(now)?;
@@ -487,6 +507,7 @@ impl<R: IndicatorRenderer> Engine<R> {
 
     fn start_pending_pulse(&mut self, now: Instant) -> io::Result<()> {
         self.pending_activity_pulse = false;
+        self.pending_completion_edge = matches!(self.policy.idle, IdlePolicy::Periodic(_));
         self.pending_activity_edge = true;
         self.mode = Mode::Rest;
         self.deadline = Some(self.edge_ready(now));
@@ -719,6 +740,41 @@ mod tests {
         engine.timeout(second_off).unwrap();
         assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
         assert_eq!(engine.mode, Mode::Rest);
+    }
+
+    #[test]
+    fn periodic_idle_short_command_returns_to_its_previous_phase() {
+        let renderer = RecordingRenderer::default();
+        let output = renderer.0.clone();
+        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
+        let mut engine = Engine::new(policy(IdlePolicy::Periodic(idle)), renderer);
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        engine.observe_activity(false, 1, start).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true]);
+
+        let completion = engine.deadline.unwrap();
+        engine.timeout(completion).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true, false]);
+        assert_eq!(engine.mode, Mode::Periodic);
+    }
+
+    #[test]
+    fn periodic_idle_burst_retains_only_one_complete_extra_pulse() {
+        let renderer = RecordingRenderer::default();
+        let output = renderer.0.clone();
+        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
+        let mut engine = Engine::new(policy(IdlePolicy::Periodic(idle)), renderer);
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        engine.observe_activity(false, 8, start).unwrap();
+
+        for _ in 0..3 {
+            let deadline = engine.deadline.unwrap();
+            engine.timeout(deadline).unwrap();
+        }
+        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
+        assert_eq!(engine.mode, Mode::Periodic);
     }
 
     #[test]
