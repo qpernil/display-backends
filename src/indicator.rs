@@ -249,6 +249,7 @@ struct Engine<R> {
     command_active: bool,
     seen_epoch: u64,
     pending_activity_edge: bool,
+    pending_activity_pulse: bool,
     attention: Option<Cadence>,
     mode: Mode,
     deadline: Option<Instant>,
@@ -265,6 +266,7 @@ impl<R: IndicatorRenderer> Engine<R> {
             command_active: false,
             seen_epoch: 0,
             pending_activity_edge: false,
+            pending_activity_pulse: false,
             attention: None,
             mode: Mode::Rest,
             deadline: None,
@@ -275,6 +277,7 @@ impl<R: IndicatorRenderer> Engine<R> {
     fn set_enabled(&mut self, enabled: bool, now: Instant) -> io::Result<()> {
         self.enabled = enabled;
         self.pending_activity_edge = false;
+        self.pending_activity_pulse = false;
         self.attention = None;
         self.mode = Mode::Rest;
         self.deadline = None;
@@ -288,15 +291,25 @@ impl<R: IndicatorRenderer> Engine<R> {
     fn observe_activity(&mut self, active: bool, epoch: u64, now: Instant) -> io::Result<()> {
         let was_active = self.command_active;
         self.command_active = active;
-        let activity_started = epoch != self.seen_epoch;
+        let commands_started = epoch.wrapping_sub(self.seen_epoch);
+        let activity_started = commands_started != 0;
         self.seen_epoch = epoch;
 
         if !self.enabled || self.attention.is_some() {
             return Ok(());
         }
         if activity_started {
-            self.pending_activity_edge = true;
-            self.deadline = Some(self.edge_ready(now));
+            let activity_in_progress =
+                self.pending_activity_edge || matches!(self.mode, Mode::Busy | Mode::SettleOff);
+            if activity_in_progress {
+                self.pending_activity_pulse = true;
+            } else {
+                self.pending_activity_edge = true;
+                self.deadline = Some(self.edge_ready(now));
+            }
+            if commands_started > 1 {
+                self.pending_activity_pulse = true;
+            }
             return self.drive_due(now);
         }
         if active {
@@ -313,6 +326,7 @@ impl<R: IndicatorRenderer> Engine<R> {
     fn attention_started(&mut self, cadence: Cadence, now: Instant) -> io::Result<()> {
         self.attention = Some(cadence);
         self.pending_activity_edge = false;
+        self.pending_activity_pulse = false;
         if !self.enabled {
             return Ok(());
         }
@@ -371,8 +385,12 @@ impl<R: IndicatorRenderer> Engine<R> {
                 }
                 Mode::SettleOff => {
                     self.set_lit(false, now)?;
-                    self.mode = Mode::Rest;
-                    self.deadline = None;
+                    if self.pending_activity_pulse {
+                        self.start_pending_pulse(now)?;
+                    } else {
+                        self.mode = Mode::Rest;
+                        self.deadline = None;
+                    }
                 }
                 Mode::TailWaitingOn => {
                     self.set_lit(true, now)?;
@@ -427,6 +445,17 @@ impl<R: IndicatorRenderer> Engine<R> {
     }
 
     fn start_idle_after_activity(&mut self, now: Instant) -> io::Result<()> {
+        if self.pending_activity_pulse {
+            if self.lit {
+                self.mode = Mode::SettleOff;
+                self.deadline = Some(self.edge_ready(now));
+                self.drive_due(now)?;
+            } else {
+                self.start_pending_pulse(now)?;
+            }
+            return Ok(());
+        }
+
         match self.policy.idle {
             IdlePolicy::Off => {
                 if self.lit {
@@ -454,6 +483,14 @@ impl<R: IndicatorRenderer> Engine<R> {
             }
         }
         Ok(())
+    }
+
+    fn start_pending_pulse(&mut self, now: Instant) -> io::Result<()> {
+        self.pending_activity_pulse = false;
+        self.pending_activity_edge = true;
+        self.mode = Mode::Rest;
+        self.deadline = Some(self.edge_ready(now));
+        self.drive_due(now)
     }
 
     fn edge_ready(&self, now: Instant) -> Instant {
@@ -656,19 +693,57 @@ mod tests {
     }
 
     #[test]
-    fn activity_edges_coalesce_by_epoch_without_a_replay_queue() {
+    fn activity_burst_retains_only_one_additional_pulse() {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
-        let mut engine = Engine::new(
-            policy(IdlePolicy::OneShotOn(Duration::from_millis(1_500))),
-            renderer,
-        );
+        let mut engine = Engine::new(policy(IdlePolicy::Off), renderer);
         let start = Instant::now();
         engine.set_enabled(true, start).unwrap();
         engine.observe_activity(false, 4, start).unwrap();
         assert_eq!(*output.lock().unwrap(), vec![true]);
         assert_eq!(engine.seen_epoch, 4);
         assert!(!engine.pending_activity_edge);
+        assert!(engine.pending_activity_pulse);
+
+        let first_off = engine.deadline.unwrap();
+        engine.timeout(first_off).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true, false]);
+        assert!(engine.pending_activity_edge);
+        assert!(!engine.pending_activity_pulse);
+
+        let second_on = engine.deadline.unwrap();
+        engine.timeout(second_on).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true, false, true]);
+        let second_off = engine.deadline.unwrap();
+        engine.timeout(second_off).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
+        assert_eq!(engine.mode, Mode::Rest);
+    }
+
+    #[test]
+    fn activity_during_a_visible_pulse_retains_one_more_pulse() {
+        let renderer = RecordingRenderer::default();
+        let output = renderer.0.clone();
+        let mut engine = Engine::new(policy(IdlePolicy::Off), renderer);
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        engine.observe_activity(false, 1, start).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true]);
+
+        engine
+            .observe_activity(false, 2, start + Duration::from_millis(1))
+            .unwrap();
+        engine
+            .observe_activity(false, 8, start + Duration::from_millis(2))
+            .unwrap();
+        assert!(engine.pending_activity_pulse);
+
+        for _ in 0..3 {
+            let deadline = engine.deadline.unwrap();
+            engine.timeout(deadline).unwrap();
+        }
+        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
+        assert_eq!(engine.mode, Mode::Rest);
     }
 
     #[test]

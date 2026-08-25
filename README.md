@@ -41,12 +41,12 @@ select complete on/off frames, update one region, or drive a physical LED.
 
 An activity handle marks the worker's single command as active and increments a
 monotonic command epoch when work starts. The epoch preserves evidence of a
-command that starts and finishes during a synchronous frame write, while
-coalescing several such commands into one visible burst rather than replaying a
-queue. Policies select the busy cadence, minimum edge interval, and one of three
-idle behaviors: stopped off, a single on period, or continuous periodic
-blinking. A scoped attention cadence can temporarily override command and idle
-scheduling.
+command that starts and finishes during a synchronous frame write. Activity
+that arrives while a pulse is already visible may retain one additional pulse;
+further activity coalesces rather than building a replay queue. Policies select
+the busy cadence, minimum edge interval, and one of three idle behaviors:
+stopped off, a single on period, or continuous periodic blinking. A scoped
+attention cadence can temporarily override command and idle scheduling.
 
 ## Build and test
 
