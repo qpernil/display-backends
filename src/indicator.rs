@@ -34,10 +34,15 @@ impl Cadence {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlinkCount {
+    Finite(u32),
+    Forever,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdlePolicy {
     Off,
-    OneShotOn(Duration),
-    Periodic(Cadence),
+    Blink { cadence: Cadence, count: BlinkCount },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,11 +237,11 @@ enum Command {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Rest,
+    ActivitySeparator,
     Busy,
     SettleOff,
-    TailWaitingOn,
-    TailOn,
-    Periodic,
+    IdleOff,
+    IdleOn,
     AttentionWaitingOn,
     Attention,
 }
@@ -250,7 +255,7 @@ struct Engine<R> {
     seen_epoch: u64,
     pending_activity_edge: bool,
     pending_activity_pulse: bool,
-    pending_completion_edge: bool,
+    idle_blinks_remaining: Option<u32>,
     attention: Option<Cadence>,
     mode: Mode,
     deadline: Option<Instant>,
@@ -268,7 +273,7 @@ impl<R: IndicatorRenderer> Engine<R> {
             seen_epoch: 0,
             pending_activity_edge: false,
             pending_activity_pulse: false,
-            pending_completion_edge: false,
+            idle_blinks_remaining: Some(0),
             attention: None,
             mode: Mode::Rest,
             deadline: None,
@@ -280,7 +285,7 @@ impl<R: IndicatorRenderer> Engine<R> {
         self.enabled = enabled;
         self.pending_activity_edge = false;
         self.pending_activity_pulse = false;
-        self.pending_completion_edge = false;
+        self.idle_blinks_remaining = Some(0);
         self.attention = None;
         self.mode = Mode::Rest;
         self.deadline = None;
@@ -302,19 +307,18 @@ impl<R: IndicatorRenderer> Engine<R> {
             return Ok(());
         }
         if activity_started {
-            let activity_in_progress =
-                self.pending_activity_edge || matches!(self.mode, Mode::Busy | Mode::SettleOff);
+            let activity_in_progress = self.pending_activity_edge
+                || matches!(
+                    self.mode,
+                    Mode::ActivitySeparator | Mode::Busy | Mode::SettleOff
+                );
             if activity_in_progress {
                 self.pending_activity_pulse = true;
             } else {
-                self.pending_activity_edge = true;
-                self.deadline = Some(self.edge_ready(now));
+                self.start_activity(now)?;
             }
             if commands_started > 1 {
                 self.pending_activity_pulse = true;
-            }
-            if !active && matches!(self.policy.idle, IdlePolicy::Periodic(_)) {
-                self.pending_completion_edge = true;
             }
             return self.drive_due(now);
         }
@@ -323,10 +327,8 @@ impl<R: IndicatorRenderer> Engine<R> {
                 self.mode = Mode::Busy;
                 self.deadline = Some(now + self.policy.busy.delay(self.lit));
             }
-        } else if was_active {
-            if matches!(self.policy.idle, IdlePolicy::Periodic(_)) {
-                self.pending_completion_edge = true;
-            }
+        } else if was_active && !self.pending_activity_edge && self.mode != Mode::ActivitySeparator
+        {
             self.start_idle_after_activity(now)?;
         }
         Ok(())
@@ -336,7 +338,6 @@ impl<R: IndicatorRenderer> Engine<R> {
         self.attention = Some(cadence);
         self.pending_activity_edge = false;
         self.pending_activity_pulse = false;
-        self.pending_completion_edge = false;
         if !self.enabled {
             return Ok(());
         }
@@ -372,7 +373,7 @@ impl<R: IndicatorRenderer> Engine<R> {
     fn drive_due(&mut self, now: Instant) -> io::Result<()> {
         while self.enabled && self.deadline.is_some_and(|deadline| deadline <= now) {
             if self.pending_activity_edge && self.attention.is_none() {
-                self.toggle(now)?;
+                self.set_lit(true, now)?;
                 self.pending_activity_edge = false;
                 if self.command_active {
                     self.mode = Mode::Busy;
@@ -384,6 +385,12 @@ impl<R: IndicatorRenderer> Engine<R> {
             }
 
             match self.mode {
+                Mode::ActivitySeparator => {
+                    self.set_lit(false, now)?;
+                    self.pending_activity_edge = true;
+                    self.mode = Mode::Rest;
+                    self.deadline = Some(self.edge_ready(now));
+                }
                 Mode::Busy => {
                     if self.command_active {
                         self.toggle(now)?;
@@ -398,29 +405,32 @@ impl<R: IndicatorRenderer> Engine<R> {
                     if self.pending_activity_pulse {
                         self.start_pending_pulse(now)?;
                     } else {
-                        self.mode = Mode::Rest;
-                        self.deadline = None;
+                        self.start_idle_after_activity(now)?;
                     }
                 }
-                Mode::TailWaitingOn => {
+                Mode::IdleOff => {
                     self.set_lit(true, now)?;
-                    self.mode = Mode::TailOn;
-                    let IdlePolicy::OneShotOn(duration) = self.policy.idle else {
-                        unreachable!();
-                    };
-                    self.deadline = Some(self.edge_time(now) + duration);
+                    self.mode = Mode::IdleOn;
+                    self.deadline = Some(self.edge_time(now) + self.idle_cadence().on);
                 }
-                Mode::TailOn => {
+                Mode::IdleOn => {
                     self.set_lit(false, now)?;
-                    self.mode = Mode::Rest;
-                    self.deadline = None;
-                }
-                Mode::Periodic => {
-                    self.toggle(now)?;
-                    let IdlePolicy::Periodic(cadence) = self.policy.idle else {
-                        unreachable!();
-                    };
-                    self.deadline = Some(self.edge_time(now) + cadence.delay(self.lit));
+                    match self.idle_blinks_remaining {
+                        None => {
+                            self.mode = Mode::IdleOff;
+                            self.deadline = Some(self.edge_time(now) + self.idle_cadence().off);
+                        }
+                        Some(remaining) if remaining > 1 => {
+                            self.idle_blinks_remaining = Some(remaining - 1);
+                            self.mode = Mode::IdleOff;
+                            self.deadline = Some(self.edge_time(now) + self.idle_cadence().off);
+                        }
+                        Some(_) => {
+                            self.idle_blinks_remaining = Some(0);
+                            self.mode = Mode::Rest;
+                            self.deadline = None;
+                        }
+                    }
                 }
                 Mode::AttentionWaitingOn => {
                     let cadence = self.attention.expect("attention cadence");
@@ -443,11 +453,20 @@ impl<R: IndicatorRenderer> Engine<R> {
 
     fn start_initial_idle(&mut self, now: Instant) {
         match self.policy.idle {
-            IdlePolicy::Periodic(cadence) => {
-                self.mode = Mode::Periodic;
+            IdlePolicy::Blink {
+                cadence,
+                count: BlinkCount::Forever,
+            } => {
+                self.idle_blinks_remaining = None;
+                self.mode = Mode::IdleOff;
                 self.deadline = Some(now + cadence.off);
             }
-            IdlePolicy::Off | IdlePolicy::OneShotOn(_) => {
+            IdlePolicy::Off
+            | IdlePolicy::Blink {
+                count: BlinkCount::Finite(_),
+                ..
+            } => {
+                self.idle_blinks_remaining = Some(0);
                 self.mode = Mode::Rest;
                 self.deadline = None;
             }
@@ -455,51 +474,39 @@ impl<R: IndicatorRenderer> Engine<R> {
     }
 
     fn start_idle_after_activity(&mut self, now: Instant) -> io::Result<()> {
-        if self.pending_completion_edge {
-            self.pending_completion_edge = false;
-            self.pending_activity_edge = true;
+        if self.lit {
+            self.mode = Mode::SettleOff;
             self.deadline = Some(self.edge_ready(now));
             self.drive_due(now)?;
             return Ok(());
         }
 
         if self.pending_activity_pulse {
-            if matches!(self.policy.idle, IdlePolicy::Periodic(_)) {
-                self.start_pending_pulse(now)?;
-            } else if self.lit {
-                self.mode = Mode::SettleOff;
-                self.deadline = Some(self.edge_ready(now));
-                self.drive_due(now)?;
-            } else {
-                self.start_pending_pulse(now)?;
-            }
+            self.start_pending_pulse(now)?;
             return Ok(());
         }
 
         match self.policy.idle {
             IdlePolicy::Off => {
-                if self.lit {
-                    self.mode = Mode::SettleOff;
-                    self.deadline = Some(self.edge_ready(now));
-                    self.drive_due(now)?;
-                } else {
-                    self.mode = Mode::Rest;
-                    self.deadline = None;
-                }
+                self.mode = Mode::Rest;
+                self.deadline = None;
             }
-            IdlePolicy::OneShotOn(duration) => {
-                if self.lit {
-                    self.mode = Mode::TailOn;
-                    self.deadline = Some(self.edge_time(now) + duration);
-                } else {
-                    self.mode = Mode::TailWaitingOn;
-                    self.deadline = Some(self.edge_ready(now));
-                    self.drive_due(now)?;
-                }
+            IdlePolicy::Blink {
+                cadence: _,
+                count: BlinkCount::Finite(count),
+            } => {
+                self.idle_blinks_remaining = Some(count);
+                self.mode = Mode::IdleOff;
+                self.deadline = Some(self.edge_ready(now));
+                self.drive_due(now)?;
             }
-            IdlePolicy::Periodic(cadence) => {
-                self.mode = Mode::Periodic;
-                self.deadline = Some(self.edge_time(now) + cadence.delay(self.lit));
+            IdlePolicy::Blink {
+                cadence,
+                count: BlinkCount::Forever,
+            } => {
+                self.idle_blinks_remaining = None;
+                self.mode = Mode::IdleOff;
+                self.deadline = Some(self.edge_time(now) + cadence.off);
             }
         }
         Ok(())
@@ -507,11 +514,25 @@ impl<R: IndicatorRenderer> Engine<R> {
 
     fn start_pending_pulse(&mut self, now: Instant) -> io::Result<()> {
         self.pending_activity_pulse = false;
-        self.pending_completion_edge = matches!(self.policy.idle, IdlePolicy::Periodic(_));
-        self.pending_activity_edge = true;
-        self.mode = Mode::Rest;
+        self.start_activity(now)
+    }
+
+    fn start_activity(&mut self, now: Instant) -> io::Result<()> {
+        if self.lit {
+            self.mode = Mode::ActivitySeparator;
+        } else {
+            self.pending_activity_edge = true;
+            self.mode = Mode::Rest;
+        }
         self.deadline = Some(self.edge_ready(now));
         self.drive_due(now)
+    }
+
+    fn idle_cadence(&self) -> Cadence {
+        let IdlePolicy::Blink { cadence, .. } = self.policy.idle else {
+            unreachable!();
+        };
+        cadence
     }
 
     fn edge_ready(&self, now: Instant) -> Instant {
@@ -597,9 +618,14 @@ fn validate_policy(policy: Policy) -> io::Result<()> {
     validate_cadence(policy.busy)?;
     match policy.idle {
         IdlePolicy::Off => Ok(()),
-        IdlePolicy::OneShotOn(duration) if !duration.is_zero() => Ok(()),
-        IdlePolicy::Periodic(cadence) => validate_cadence(cadence),
-        IdlePolicy::OneShotOn(_) => Err(invalid_policy()),
+        IdlePolicy::Blink {
+            cadence,
+            count: BlinkCount::Finite(0),
+        } => {
+            validate_cadence(cadence)?;
+            Err(invalid_policy())
+        }
+        IdlePolicy::Blink { cadence, .. } => validate_cadence(cadence),
     }
 }
 
@@ -642,33 +668,46 @@ mod tests {
     }
 
     #[test]
-    fn completed_short_command_becomes_one_shot_on_period() {
+    fn completed_short_command_is_followed_by_one_counted_idle_blink() {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
+        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
         let mut engine = Engine::new(
-            policy(IdlePolicy::OneShotOn(Duration::from_millis(1_500))),
+            policy(IdlePolicy::Blink {
+                cadence: idle,
+                count: BlinkCount::Finite(1),
+            }),
             renderer,
         );
         let start = Instant::now();
         engine.set_enabled(true, start).unwrap();
         engine.observe_activity(false, 1, start).unwrap();
         assert_eq!(*output.lock().unwrap(), vec![true]);
-        assert_eq!(engine.mode, Mode::TailOn);
+        assert_eq!(engine.mode, Mode::SettleOff);
 
-        let tail_due = engine.deadline.unwrap();
-        engine.timeout(tail_due - Duration::from_millis(1)).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true]);
-        engine.timeout(tail_due).unwrap();
+        let activity_off = engine.deadline.unwrap();
+        engine.timeout(activity_off).unwrap();
         assert_eq!(*output.lock().unwrap(), vec![true, false]);
+
+        let idle_on = engine.deadline.unwrap();
+        engine.timeout(idle_on).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true, false, true]);
+        let idle_off = engine.deadline.unwrap();
+        engine.timeout(idle_off).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
         assert_eq!(engine.mode, Mode::Rest);
     }
 
     #[test]
-    fn sustained_command_uses_asymmetric_busy_cadence_then_one_shot_idle() {
+    fn sustained_command_uses_asymmetric_busy_cadence_then_counted_idle() {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
+        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
         let mut engine = Engine::new(
-            policy(IdlePolicy::OneShotOn(Duration::from_millis(1_500))),
+            policy(IdlePolicy::Blink {
+                cadence: idle,
+                count: BlinkCount::Finite(1),
+            }),
             renderer,
         );
         let start = Instant::now();
@@ -685,9 +724,13 @@ mod tests {
 
         let end = start + Duration::from_millis(110);
         engine.observe_activity(false, 1, end).unwrap();
-        let tail_due = engine.deadline.unwrap();
-        engine.timeout(tail_due).unwrap();
         assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
+        let idle_on = engine.deadline.unwrap();
+        engine.timeout(idle_on).unwrap();
+        assert_eq!(
+            *output.lock().unwrap(),
+            vec![true, false, true, false, true]
+        );
     }
 
     #[test]
@@ -695,10 +738,10 @@ mod tests {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
         let mut engine = Engine::new(
-            policy(IdlePolicy::Periodic(Cadence::new(
-                Duration::from_millis(1_500),
-                Duration::from_millis(1_500),
-            ))),
+            policy(IdlePolicy::Blink {
+                cadence: Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500)),
+                count: BlinkCount::Forever,
+            }),
             renderer,
         );
         let start = Instant::now();
@@ -743,11 +786,17 @@ mod tests {
     }
 
     #[test]
-    fn periodic_idle_short_command_returns_to_its_previous_phase() {
+    fn periodic_idle_short_command_finishes_off_before_idle_restarts() {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
         let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
-        let mut engine = Engine::new(policy(IdlePolicy::Periodic(idle)), renderer);
+        let mut engine = Engine::new(
+            policy(IdlePolicy::Blink {
+                cadence: idle,
+                count: BlinkCount::Forever,
+            }),
+            renderer,
+        );
         let start = Instant::now();
         engine.set_enabled(true, start).unwrap();
         engine.observe_activity(false, 1, start).unwrap();
@@ -756,7 +805,33 @@ mod tests {
         let completion = engine.deadline.unwrap();
         engine.timeout(completion).unwrap();
         assert_eq!(*output.lock().unwrap(), vec![true, false]);
-        assert_eq!(engine.mode, Mode::Periodic);
+        assert_eq!(engine.mode, Mode::IdleOff);
+    }
+
+    #[test]
+    fn periodic_idle_on_inserts_an_off_separator_before_activity_on() {
+        let renderer = RecordingRenderer::default();
+        let output = renderer.0.clone();
+        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
+        let mut engine = Engine::new(
+            policy(IdlePolicy::Blink {
+                cadence: idle,
+                count: BlinkCount::Forever,
+            }),
+            renderer,
+        );
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        let idle_on = engine.deadline.unwrap();
+        engine.timeout(idle_on).unwrap();
+        engine.observe_activity(false, 1, idle_on).unwrap();
+
+        for _ in 0..3 {
+            let deadline = engine.deadline.unwrap();
+            engine.timeout(deadline).unwrap();
+        }
+        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
+        assert_eq!(engine.mode, Mode::IdleOff);
     }
 
     #[test]
@@ -764,7 +839,13 @@ mod tests {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
         let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
-        let mut engine = Engine::new(policy(IdlePolicy::Periodic(idle)), renderer);
+        let mut engine = Engine::new(
+            policy(IdlePolicy::Blink {
+                cadence: idle,
+                count: BlinkCount::Forever,
+            }),
+            renderer,
+        );
         let start = Instant::now();
         engine.set_enabled(true, start).unwrap();
         engine.observe_activity(false, 8, start).unwrap();
@@ -774,7 +855,7 @@ mod tests {
             engine.timeout(deadline).unwrap();
         }
         assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
-        assert_eq!(engine.mode, Mode::Periodic);
+        assert_eq!(engine.mode, Mode::IdleOff);
     }
 
     #[test]
@@ -842,7 +923,7 @@ mod tests {
         let controller = Controller::start(
             Policy::new(
                 Cadence::new(Duration::from_millis(4), Duration::from_millis(2)),
-                IdlePolicy::OneShotOn(Duration::from_millis(5)),
+                IdlePolicy::Off,
                 Duration::from_millis(1),
             ),
             move |lit| {
