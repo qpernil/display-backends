@@ -48,6 +48,11 @@ the busy cadence, minimum edge interval, and one of three idle behaviors:
 stopped off, a single on period, or continuous periodic blinking. A scoped
 attention cadence can temporarily override command and idle scheduling.
 
+Cadence and minimum-edge intervals are measured from the start of one renderer
+call to the start of the next. Rendering time is therefore part of the interval,
+not an added delay. A backend that takes longer than an interval becomes the
+natural rate limit; the scheduler does not replay missed transitions.
+
 ## Build and test
 
 Rust 1.85.0 or later is required.

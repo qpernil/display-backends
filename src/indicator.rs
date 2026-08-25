@@ -510,9 +510,10 @@ impl<R: IndicatorRenderer> Engine<R> {
 
     fn set_lit(&mut self, lit: bool, now: Instant) -> io::Result<()> {
         if self.lit != lit {
+            let edge_started = Instant::now().max(now);
             self.renderer.set_indicator(lit)?;
             self.lit = lit;
-            self.last_edge = Some(Instant::now().max(now));
+            self.last_edge = Some(edge_started);
         }
         Ok(())
     }
@@ -744,6 +745,20 @@ mod tests {
         }
         assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
         assert_eq!(engine.mode, Mode::Rest);
+    }
+
+    #[test]
+    fn renderer_time_is_part_of_the_minimum_edge_interval() {
+        let render_time = Duration::from_millis(12);
+        let mut engine = Engine::new(policy(IdlePolicy::Off), move |_| {
+            thread::sleep(render_time);
+            Ok(())
+        });
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        engine.observe_activity(false, 1, start).unwrap();
+
+        assert!(engine.deadline.unwrap() <= Instant::now());
     }
 
     #[test]
