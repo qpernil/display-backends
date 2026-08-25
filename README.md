@@ -44,12 +44,15 @@ monotonic command epoch when work starts. The epoch preserves evidence of a
 command that starts and finishes during a synchronous frame write. Activity
 that arrives while a pulse is already visible may retain one additional pulse;
 further activity coalesces rather than building a replay queue. Policies select
-the busy cadence, minimum edge interval, and one of three idle behaviors:
-stopped off, a single on period, or continuous periodic blinking. A scoped
-attention cadence can temporarily override command and idle scheduling.
-With periodic idle, each short activity pulse returns to the prior indicator
-phase before the idle cadence resumes; activity therefore cannot merely shift
-the phase of a slow idle blink.
+the busy cadence, minimum edge interval, and an idle behavior: stopped off or a
+blink cadence repeated a finite number of times or forever. A finite count runs
+after activity; a forever cadence also starts when the indicator is enabled. A
+scoped attention cadence can temporarily override command and idle scheduling.
+
+Activity always establishes an on phase. If blinking idle is already on, the
+scheduler inserts a minimum-length off separator before activity turns on. A
+short command finishes off; a sustained command continues directly into the
+busy cadence. Any configured idle blinking then restarts from off.
 
 Cadence and minimum-edge intervals are measured from the start of one renderer
 call to the start of the next. Rendering time is therefore part of the interval,
@@ -122,3 +125,9 @@ reset/D/C/backlight operations, SPI/I2C writes, clearing, and display-off—and
 an optional producer-to-native conversion layer. Its indicator module owns only
 logical activity timing. Composition, display power, resource discovery,
 process lifecycle, retry policy, and logging remain in the caller.
+
+## Future work
+
+The [TCP display backend plan](docs/future-tcp-display-backend.md) describes a
+transactional remote backend for rendering frames from another Linux machine
+on displays physically attached to the Pi.
