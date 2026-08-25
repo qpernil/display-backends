@@ -32,6 +32,22 @@ bus descriptors and exact GPIO line-request descriptors. It duplicates those
 descriptors with close-on-exec and owns only the duplicates. This makes it
 suitable for workers whose capabilities are opened by a privileged supervisor.
 
+## Activity indicators
+
+The device-neutral `indicator` module schedules one logical indicator bit and
+calls an `IndicatorRenderer` supplied by the application. It does not know what
+the bit looks like or control the containing display's power. A renderer may
+select complete on/off frames, update one region, or drive a physical LED.
+
+An activity handle marks the worker's single command as active and increments a
+monotonic command epoch when work starts. The epoch preserves evidence of a
+command that starts and finishes during a synchronous frame write, while
+coalescing several such commands into one visible burst rather than replaying a
+queue. Policies select the busy cadence, minimum edge interval, and one of three
+idle behaviors: stopped off, a single on period, or continuous periodic
+blinking. A scoped attention cadence can temporarily override command and idle
+scheduling.
+
 ## Build and test
 
 Rust 1.85.0 or later is required.
@@ -95,6 +111,6 @@ before clearing and releasing the display.
 
 The library owns native display mechanics—controller setup,
 reset/D/C/backlight operations, SPI/I2C writes, clearing, and display-off—and
-an optional producer-to-native conversion layer. Composition remains in the
-caller. Its caller also owns resource discovery, process lifecycle, retry
-policy, and logging.
+an optional producer-to-native conversion layer. Its indicator module owns only
+logical activity timing. Composition, display power, resource discovery,
+process lifecycle, retry policy, and logging remain in the caller.
