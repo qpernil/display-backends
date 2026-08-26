@@ -205,13 +205,208 @@ impl TryFrom<u32> for Backend {
     }
 }
 
+/// A rectangular update in controller-native coordinates.
+///
+/// Color-display rows are individual pixels. Monochrome-display rectangles
+/// are rounded to eight-pixel page rows because that is the controller's
+/// smallest independently addressable vertical unit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
+impl UpdateRect {
+    fn full(format: FrameFormat) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width: format.width,
+            height: format.height,
+        }
+    }
+}
+
+/// Converts producer frames to a complete native frame and diffs it against
+/// the last successfully committed frame.
+///
+/// Preparing an update never changes the committed frame. Call [`Self::commit`]
+/// only after the backend transfer succeeds. A failed transfer can therefore
+/// be retried without incorrectly treating unsent pixels as current.
+pub struct DisplayConverter {
+    backend: Backend,
+    current: Vec<u8>,
+    next: Vec<u8>,
+    current_known: bool,
+    pending: bool,
+}
+
+impl DisplayConverter {
+    pub fn new(backend: Backend) -> Self {
+        let length = backend
+            .native_format()
+            .required_len()
+            .expect("native display formats are valid");
+        Self {
+            backend,
+            current: vec![0; length],
+            next: vec![0; length],
+            current_known: false,
+            pending: false,
+        }
+    }
+
+    pub fn native_format(&self) -> FrameFormat {
+        self.backend.native_format()
+    }
+
+    pub fn current_is_known(&self) -> bool {
+        self.current_known
+    }
+
+    /// Record that controller memory is known to contain an all-black frame.
+    pub fn assume_blank(&mut self) {
+        self.current.fill(0);
+        self.current_known = true;
+        self.pending = false;
+    }
+
+    /// Forget controller memory contents, forcing the next frame to be sent in
+    /// full.
+    pub fn invalidate(&mut self) {
+        self.current_known = false;
+        self.pending = false;
+    }
+
+    pub fn prepare_native(&mut self, framebuffer: &[u8]) -> io::Result<Option<UpdateRect>> {
+        if framebuffer.len() != self.native_format().required_len()? {
+            return Err(invalid_argument());
+        }
+        self.next.copy_from_slice(framebuffer);
+        Ok(self.finish_prepare())
+    }
+
+    pub fn prepare_frame(
+        &mut self,
+        framebuffer: &[u8],
+        format: FrameFormat,
+    ) -> io::Result<Option<UpdateRect>> {
+        if framebuffer.len() != format.required_len()? {
+            return Err(invalid_argument());
+        }
+        if format == self.native_format() {
+            self.next.copy_from_slice(framebuffer);
+        } else {
+            match self.backend {
+                Backend::Ssd1306I2c | Backend::Sh1106I2c | Backend::Sh1106Spi => {
+                    let destination: &mut [u8; MONO1_FRAME_SIZE] = self
+                        .next
+                        .as_mut_slice()
+                        .try_into()
+                        .expect("monochrome native frame has a fixed size");
+                    encode_mono1_frame(destination, framebuffer, format);
+                }
+                Backend::St7789Spi => encode_rgb565_frame(
+                    &mut self.next,
+                    framebuffer,
+                    format,
+                    ST7789_PANEL_WIDTH,
+                    ST7789_PANEL_HEIGHT,
+                ),
+            }
+        }
+        Ok(self.finish_prepare())
+    }
+
+    pub fn prepare_blank(&mut self) -> Option<UpdateRect> {
+        self.next.fill(0);
+        self.finish_prepare()
+    }
+
+    pub fn next_frame(&self) -> &[u8] {
+        &self.next
+    }
+
+    pub fn commit(&mut self) {
+        if self.pending {
+            self.current.copy_from_slice(&self.next);
+            self.current_known = true;
+            self.pending = false;
+        }
+    }
+
+    fn finish_prepare(&mut self) -> Option<UpdateRect> {
+        let update = if self.current_known {
+            diff_native_frame(self.native_format(), &self.current, &self.next)
+        } else {
+            Some(UpdateRect::full(self.native_format()))
+        };
+        self.pending = update.is_some();
+        update
+    }
+}
+
+fn diff_native_frame(format: FrameFormat, current: &[u8], next: &[u8]) -> Option<UpdateRect> {
+    let (rows, bytes_per_element, row_height) = match format.pixel_format {
+        PixelFormat::Mono1MsbReversePage => (format.height.div_ceil(8), 1, 8),
+        PixelFormat::Rgb565Be => (format.height, 2, 1),
+        PixelFormat::Mono8 => unreachable!("Mono8 is not a native display format"),
+    };
+    let mut minimum_x = format.width;
+    let mut minimum_row = rows;
+    let mut maximum_x = 0;
+    let mut maximum_row = 0;
+    let mut changed = false;
+    for row in 0..rows {
+        for x in 0..format.width {
+            let offset = row * format.stride + x * bytes_per_element;
+            if current[offset..offset + bytes_per_element]
+                != next[offset..offset + bytes_per_element]
+            {
+                changed = true;
+                minimum_x = minimum_x.min(x);
+                maximum_x = maximum_x.max(x);
+                minimum_row = minimum_row.min(row);
+                maximum_row = maximum_row.max(row);
+            }
+        }
+    }
+    if !changed {
+        return None;
+    }
+    Some(UpdateRect {
+        x: minimum_x,
+        y: minimum_row * row_height,
+        width: maximum_x - minimum_x + 1,
+        height: (maximum_row - minimum_row + 1) * row_height,
+    })
+}
+
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const SSD1306_INIT: &[u8] = &[
     0x00, 0xae, 0xd5, 0x80, 0xa8, 0x3f, 0xd3, 0x00, 0x40, 0x8d, 0x14, 0x20, 0x00, 0xa1, 0xc8, 0xda,
     0x12, 0x81, 0xcf, 0xd9, 0xf1, 0xdb, 0x40, 0xa4, 0xa6, 0xaf,
 ];
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub(crate) const SSD1306_ADDRESS: &[u8] = &[0x00, 0x21, 0x00, 0x7f, 0x22, 0x00, 0x07];
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn ssd1306_address(rect: UpdateRect) -> [u8; 7] {
+    let x_end = rect.x + rect.width - 1;
+    let page = rect.y / 8;
+    let page_end = (rect.y + rect.height) / 8 - 1;
+    [
+        0x00,
+        0x21,
+        rect.x as u8,
+        x_end as u8,
+        0x22,
+        page as u8,
+        page_end as u8,
+    ]
+}
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const SH1106_INIT: &[u8] = &[
@@ -220,6 +415,17 @@ pub(crate) const SH1106_INIT: &[u8] = &[
 ];
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const SH1106_DISPLAY_ON: &[u8] = &[0x00, 0xaf];
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn sh1106_page_address(page: usize, x: usize) -> [u8; 4] {
+    let column = x + 2;
+    [
+        0x00,
+        0xb0 | page as u8,
+        (column & 0x0f) as u8,
+        0x10 | (column >> 4) as u8,
+    ]
+}
 
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy)]
@@ -556,5 +762,121 @@ mod tests {
         assert_eq!(ST7789_INIT[0].delay_ms, 120);
         assert_eq!(ST7789_INIT[1].data, [0x70]);
         assert_eq!(ST7789_INIT[16].command, 0x29);
+    }
+
+    #[test]
+    fn converter_requires_a_successful_commit_before_advancing_current() {
+        let mut converter = DisplayConverter::new(Backend::St7789Spi);
+        let blank = vec![0; ST7789_FRAMEBUFFER_SIZE];
+        assert_eq!(
+            converter.prepare_native(&blank).unwrap(),
+            Some(UpdateRect::full(FrameFormat::rgb565_240x240()))
+        );
+        assert!(!converter.current_is_known());
+        assert_eq!(
+            converter.prepare_native(&blank).unwrap(),
+            Some(UpdateRect::full(FrameFormat::rgb565_240x240()))
+        );
+        converter.commit();
+        assert!(converter.current_is_known());
+        assert_eq!(converter.prepare_native(&blank).unwrap(), None);
+    }
+
+    #[test]
+    fn rgb565_diff_finds_the_minimum_pixel_rectangle() {
+        let mut converter = DisplayConverter::new(Backend::St7789Spi);
+        converter.assume_blank();
+        let mut next = vec![0; ST7789_FRAMEBUFFER_SIZE];
+        for (x, y) in [(17, 29), (19, 31), (18, 30)] {
+            let offset = (y * ST7789_PANEL_WIDTH + x) * 2;
+            next[offset..offset + 2].copy_from_slice(&0xf81f_u16.to_be_bytes());
+        }
+        assert_eq!(
+            converter.prepare_native(&next).unwrap(),
+            Some(UpdateRect {
+                x: 17,
+                y: 29,
+                width: 3,
+                height: 3,
+            })
+        );
+        converter.commit();
+        next[(30 * ST7789_PANEL_WIDTH + 18) * 2..(30 * ST7789_PANEL_WIDTH + 18) * 2 + 2].fill(0);
+        assert_eq!(
+            converter.prepare_native(&next).unwrap(),
+            Some(UpdateRect {
+                x: 18,
+                y: 30,
+                width: 1,
+                height: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn monochrome_diff_uses_controller_pages_and_columns() {
+        let mut converter = DisplayConverter::new(Backend::Ssd1306I2c);
+        converter.assume_blank();
+        let mut next = vec![0; MONO1_FRAME_SIZE];
+        next[2 * MONO1_FRAME_STRIDE + 7] = 0x80;
+        next[4 * MONO1_FRAME_STRIDE + 11] = 0x01;
+        let rect = UpdateRect {
+            x: 7,
+            y: 16,
+            width: 5,
+            height: 24,
+        };
+        assert_eq!(converter.prepare_native(&next).unwrap(), Some(rect));
+        assert_eq!(ssd1306_address(rect), [0x00, 0x21, 7, 11, 0x22, 2, 4]);
+        assert_eq!(sh1106_page_address(2, 7), [0x00, 0xb2, 0x09, 0x10]);
+        assert_eq!(sh1106_page_address(7, 127), [0x00, 0xb7, 0x01, 0x18]);
+    }
+
+    #[test]
+    fn full_native_conversion_preserves_black_bars_between_aspect_ratios() {
+        let mut converter = DisplayConverter::new(Backend::St7789Spi);
+        converter.assume_blank();
+        let wide = FrameFormat::new(PixelFormat::Mono8, 2, 1, 2).unwrap();
+        let update = converter.prepare_frame(&[0xff, 0xff], wide).unwrap();
+        assert_eq!(
+            update,
+            Some(UpdateRect {
+                x: 0,
+                y: 60,
+                width: 240,
+                height: 120,
+            })
+        );
+        converter.commit();
+
+        let tall = FrameFormat::new(PixelFormat::Mono8, 1, 2, 1).unwrap();
+        assert_eq!(
+            converter.prepare_frame(&[0xff, 0xff], tall).unwrap(),
+            Some(UpdateRect::full(FrameFormat::rgb565_240x240()))
+        );
+        let next = converter.next_frame();
+        assert_eq!(&next[..2], &[0, 0]);
+        let center = (120 * ST7789_PANEL_WIDTH + 120) * 2;
+        assert_eq!(&next[center..center + 2], &[0xff, 0xff]);
+    }
+
+    #[test]
+    fn blank_preparation_only_updates_changed_content() {
+        let mut converter = DisplayConverter::new(Backend::Sh1106Spi);
+        converter.assume_blank();
+        assert_eq!(converter.prepare_blank(), None);
+        let mut frame = vec![0; MONO1_FRAME_SIZE];
+        frame[9] = 1;
+        assert!(converter.prepare_native(&frame).unwrap().is_some());
+        converter.commit();
+        assert_eq!(
+            converter.prepare_blank(),
+            Some(UpdateRect {
+                x: 9,
+                y: 0,
+                width: 1,
+                height: 8,
+            })
+        );
     }
 }
