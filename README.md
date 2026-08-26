@@ -27,6 +27,14 @@ SSD1306 and SH1106 threshold intensity at 128 into native 1-bit pages. ST7789
 maps monochrome intensity to RGB565 grayscale. Native frames bypass all of that
 work.
 
+Each backend keeps the last successfully displayed native frame and compares it
+with the next complete native frame. An unchanged frame produces no bus traffic.
+For ST7789, the backend sends the smallest pixel-aligned bounding rectangle that
+contains every change. SSD1306 and SH1106 use the smallest changed column range
+and the changed eight-pixel controller pages. The new frame becomes current only
+after the entire transfer succeeds, so an interrupted update is retried against
+the last known-good display state.
+
 The library never opens hardware paths. Its Rust and C APIs accept already-open
 bus descriptors and exact GPIO line-request descriptors. It duplicates those
 descriptors with close-on-exec and owns only the duplicates. This makes it
