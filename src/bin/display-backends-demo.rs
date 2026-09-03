@@ -3,17 +3,17 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use display_backends::{
-        set_mono1_pixel, Backend, Display, FrameFormat, MONO1_FRAME_HEIGHT, MONO1_FRAME_SIZE,
-        MONO1_FRAME_WIDTH, ST7789_FRAMEBUFFER_SIZE, ST7789_PANEL_HEIGHT, ST7789_PANEL_WIDTH,
+        Backend, Display, FrameFormat, MONO1_FRAME_HEIGHT, MONO1_FRAME_SIZE, MONO1_FRAME_WIDTH,
+        ST7789_FRAMEBUFFER_SIZE, ST7789_PANEL_HEIGHT, ST7789_PANEL_WIDTH, set_mono1_pixel,
     };
     use embedded_graphics::{
-        mono_font::{ascii::FONT_10X20, ascii::FONT_6X10, MonoTextStyle},
+        mono_font::{MonoTextStyle, ascii::FONT_6X10, ascii::FONT_10X20},
         pixelcolor::{BinaryColor, Rgb565},
         prelude::*,
         primitives::{Circle, PrimitiveStyle, Rectangle},
         text::{Alignment, Text},
     };
-    use gpiocdev_uapi::v2::{get_line, LineConfig, LineFlags, LineRequest, LineValues, Offsets};
+    use gpiocdev_uapi::v2::{LineConfig, LineFlags, LineRequest, LineValues, Offsets, get_line};
     use std::{
         error::Error,
         fs::{File, OpenOptions},
@@ -109,7 +109,7 @@ mod linux {
 
         fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
             let pixel = color.into_storage().to_be_bytes();
-            for destination in self.0.chunks_exact_mut(2) {
+            for destination in self.0.as_chunks_mut::<2>().0 {
                 destination.copy_from_slice(&pixel);
             }
             Ok(())

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::{
-    sh1106_page_address, ssd1306_address, st7789_window, Backend, DisplayConverter, FrameFormat,
-    UpdateRect, MONO1_FRAME_STRIDE, SH1106_DISPLAY_ON, SH1106_INIT, SSD1306_INIT, ST7789_INIT,
-    ST7789_PANEL_WIDTH,
+    Backend, DisplayConverter, FrameFormat, MONO1_FRAME_STRIDE, SH1106_DISPLAY_ON, SH1106_INIT,
+    SSD1306_INIT, ST7789_INIT, ST7789_PANEL_WIDTH, UpdateRect, sh1106_page_address,
+    ssd1306_address, st7789_window,
 };
-use gpiocdev_uapi::v2::{set_line_values, LineValues};
+use gpiocdev_uapi::v2::{LineValues, set_line_values};
 use spidev::{SpiModeFlags, Spidev, SpidevOptions};
 use std::{
     fs::File,
