@@ -12,7 +12,7 @@ fn error_code(error: &io::Error) -> libc::c_int {
     error.raw_os_error().unwrap_or(libc::EIO)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn display_backends_create(
     backend: u32,
     bus_fd: RawFd,
@@ -38,7 +38,7 @@ pub unsafe extern "C" fn display_backends_create(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn display_backends_write_frame(
     handle: *mut DisplayBackendsHandle,
     pixel_format: u32,
@@ -73,7 +73,7 @@ pub unsafe extern "C" fn display_backends_write_frame(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn display_backends_write_native_frame(
     handle: *mut DisplayBackendsHandle,
     framebuffer: *const u8,
@@ -96,7 +96,7 @@ pub unsafe extern "C" fn display_backends_write_native_frame(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn display_backends_shutdown(
     handle: *mut DisplayBackendsHandle,
 ) -> libc::c_int {
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn display_backends_shutdown(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn display_backends_destroy(handle: *mut DisplayBackendsHandle) {
     if !handle.is_null() {
         drop(unsafe { Box::from_raw(handle) });

@@ -115,11 +115,7 @@ impl FrameFormat {
                 let offset =
                     (self.height.div_ceil(8) - 1 - page) * self.stride + (self.stride - 1 - x);
                 let mask = 1 << (7 - y % 8);
-                if data[offset] & mask != 0 {
-                    0xff
-                } else {
-                    0x00
-                }
+                if data[offset] & mask != 0 { 0xff } else { 0x00 }
             }
             PixelFormat::Mono8 => data[y * self.stride + x],
             PixelFormat::Rgb565Be => {
@@ -670,7 +666,7 @@ mod tests {
             for x in 0..240 {
                 let source_x = x * format.width / 240;
                 let source_y = y * format.height / 120;
-                let expected = if ((source_x / 7) + (source_y / 5)) % 2 != 0 {
+                let expected = if ((source_x / 7) + (source_y / 5)) & 1 != 0 {
                     0xff
                 } else {
                     0x00

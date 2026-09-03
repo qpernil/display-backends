@@ -69,7 +69,7 @@ natural rate limit; the scheduler does not replay missed transitions.
 
 ## Build and test
 
-Rust 1.85.0 or later is required.
+Rust 1.94.0 or later is required.
 
 ```sh
 cargo test --locked

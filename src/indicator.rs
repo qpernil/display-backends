@@ -7,9 +7,9 @@
 //! for the lifetime and power state of the complete display.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -25,11 +25,7 @@ impl Cadence {
     }
 
     fn delay(self, lit: bool) -> Duration {
-        if lit {
-            self.on
-        } else {
-            self.off
-        }
+        if lit { self.on } else { self.off }
     }
 }
 

@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Run tests
+        run: cargo test --locked --all-features
+
+      - name: Build release libraries and demo
+        run: cargo build --locked --release --all-features
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Check minimum supported Rust version
+        run: cargo check --locked --all-features
+
+  linux-arm64:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Linux ARM64 Rust target
+        run: rustup target add aarch64-unknown-linux-gnu
+
+      - name: Check Linux ARM64 build
+        run: cargo check --locked --all-features --target aarch64-unknown-linux-gnu
