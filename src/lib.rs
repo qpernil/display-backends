@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Physical display backends for Linux workers that receive already-opened
 //! bus and GPIO capability handles.

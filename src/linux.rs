@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::{
     Backend, DisplayConverter, FrameFormat, MONO1_FRAME_STRIDE, SH1106_DISPLAY_ON, SH1106_INIT,

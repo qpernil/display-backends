@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Linux userspace display backends over caller-supplied bus and GPIO handles"
-license = "GPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [lib]

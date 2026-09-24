@@ -139,3 +139,8 @@ process lifecycle, retry policy, and logging remain in the caller.
 The [TCP display backend plan](docs/future-tcp-display-backend.md) describes a
 transactional remote backend for rendering frames from another Linux machine
 on displays physically attached to the Pi.
+
+## License
+
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option.
