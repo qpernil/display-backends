@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
 
 #ifndef DISPLAY_BACKENDS_H
 #define DISPLAY_BACKENDS_H

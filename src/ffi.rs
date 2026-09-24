@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::{Backend, Display, FrameFormat, PixelFormat};
 use std::{io, os::fd::RawFd, ptr, slice};
