@@ -46,6 +46,10 @@ pub struct Policy {
     pub busy: Cadence,
     pub idle: IdlePolicy,
     pub minimum_edge: Duration,
+    /// Minimum off time before activity starts, reusing an existing off edge.
+    pub minimum_activity_off: Duration,
+    /// Minimum visible on time for completed activity, independent of busy cadence.
+    pub minimum_activity_on: Duration,
 }
 
 impl Policy {
@@ -54,7 +58,18 @@ impl Policy {
             busy,
             idle,
             minimum_edge,
+            minimum_activity_off: minimum_edge,
+            minimum_activity_on: busy.on,
         }
+    }
+    pub const fn with_minimum_activity_off(mut self, duration: Duration) -> Self {
+        self.minimum_activity_off = duration;
+        self
+    }
+
+    pub const fn with_minimum_activity_on(mut self, duration: Duration) -> Self {
+        self.minimum_activity_on = duration;
+        self
     }
 }
 
@@ -233,12 +248,11 @@ enum Command {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Rest,
-    ActivitySeparator,
     Busy,
     SettleOff,
+    Recovery,
     IdleOff,
     IdleOn,
-    AttentionWaitingOn,
     Attention,
 }
 
@@ -250,12 +264,13 @@ struct Engine<R> {
     command_active: bool,
     seen_epoch: u64,
     pending_activity_edge: bool,
-    pending_activity_pulse: bool,
     idle_blinks_remaining: Option<u32>,
     attention: Option<Cadence>,
+    activity_over_attention: bool,
     mode: Mode,
     deadline: Option<Instant>,
     last_edge: Option<Instant>,
+    activity_on_until: Option<Instant>,
 }
 
 impl<R: IndicatorRenderer> Engine<R> {
@@ -268,21 +283,23 @@ impl<R: IndicatorRenderer> Engine<R> {
             command_active: false,
             seen_epoch: 0,
             pending_activity_edge: false,
-            pending_activity_pulse: false,
             idle_blinks_remaining: Some(0),
             attention: None,
+            activity_over_attention: false,
             mode: Mode::Rest,
             deadline: None,
             last_edge: None,
+            activity_on_until: None,
         }
     }
 
     fn set_enabled(&mut self, enabled: bool, now: Instant) -> io::Result<()> {
         self.enabled = enabled;
         self.pending_activity_edge = false;
-        self.pending_activity_pulse = false;
         self.idle_blinks_remaining = Some(0);
         self.attention = None;
+        self.activity_over_attention = false;
+        self.activity_on_until = None;
         self.mode = Mode::Rest;
         self.deadline = None;
         self.set_lit(false, now)?;
@@ -292,39 +309,39 @@ impl<R: IndicatorRenderer> Engine<R> {
         Ok(())
     }
 
+    fn activity_running(&self) -> bool {
+        self.command_active && (self.attention.is_none() || self.activity_over_attention)
+    }
+
     fn observe_activity(&mut self, active: bool, epoch: u64, now: Instant) -> io::Result<()> {
         let was_active = self.command_active;
         self.command_active = active;
         let commands_started = epoch.wrapping_sub(self.seen_epoch);
-        let activity_started = commands_started != 0;
         self.seen_epoch = epoch;
-
-        if !self.enabled || self.attention.is_some() {
+        if !self.enabled {
             return Ok(());
         }
-        if activity_started {
-            let activity_in_progress = self.pending_activity_edge
-                || matches!(
-                    self.mode,
-                    Mode::ActivitySeparator | Mode::Busy | Mode::SettleOff
-                );
-            if activity_in_progress {
-                self.pending_activity_pulse = true;
-            } else {
+        if commands_started != 0 {
+            self.activity_over_attention = true;
+            // Coalesce into the current indication without extending its lifetime.
+            // Epochs preserve collapsed work, but never count replay pulses.
+            if !self.pending_activity_edge && !matches!(self.mode, Mode::Busy | Mode::SettleOff) {
                 self.start_activity(now)?;
+            } else if active && self.mode == Mode::SettleOff {
+                self.mode = Mode::Busy;
+                self.deadline = Some(self.last_edge.unwrap_or(now) + self.policy.busy.on);
             }
-            if commands_started > 1 {
-                self.pending_activity_pulse = true;
+            if !active && self.mode == Mode::Busy && !self.pending_activity_edge {
+                self.start_idle_after_activity(now)?;
             }
             return self.drive_due(now);
         }
-        if active {
-            if self.mode != Mode::Busy {
-                self.mode = Mode::Busy;
-                self.deadline = Some(now + self.policy.busy.delay(self.lit));
-            }
-        } else if was_active && !self.pending_activity_edge && self.mode != Mode::ActivitySeparator
-        {
+        // The command which requested attention is waiting, rather than doing work.
+        // A later command epoch may temporarily take over that background pattern.
+        if self.attention.is_some() && !self.activity_over_attention {
+            return Ok(());
+        }
+        if !active && was_active && self.mode == Mode::Busy && !self.pending_activity_edge {
             self.start_idle_after_activity(now)?;
         }
         Ok(())
@@ -332,34 +349,42 @@ impl<R: IndicatorRenderer> Engine<R> {
 
     fn attention_started(&mut self, cadence: Cadence, now: Instant) -> io::Result<()> {
         self.attention = Some(cadence);
-        self.pending_activity_edge = false;
-        self.pending_activity_pulse = false;
+        self.activity_over_attention = false;
         if !self.enabled {
             return Ok(());
         }
-        if self.lit {
-            self.mode = Mode::Attention;
-            self.deadline = Some(now + cadence.on);
-        } else {
-            self.mode = Mode::AttentionWaitingOn;
-            self.deadline = Some(self.edge_ready(now));
-            self.drive_due(now)?;
+        if self.pending_activity_edge || self.mode == Mode::SettleOff {
+            return Ok(());
         }
-        Ok(())
+        if self.mode == Mode::Busy {
+            self.start_idle_after_activity(now)
+        } else {
+            self.start_recovery(now)
+        }
     }
 
     fn attention_ended(&mut self, now: Instant) -> io::Result<()> {
         self.attention = None;
+        self.activity_over_attention = false;
         if !self.enabled {
             return Ok(());
         }
-        if self.command_active {
-            self.mode = Mode::Busy;
-            self.deadline = Some(now + self.policy.busy.delay(self.lit));
-        } else {
-            self.start_idle_after_activity(now)?;
+        if self.pending_activity_edge {
+            return Ok(());
         }
-        Ok(())
+        if self.command_active {
+            if matches!(self.mode, Mode::Busy | Mode::SettleOff) && self.lit {
+                self.mode = Mode::Busy;
+                self.deadline = Some(self.activity_on_until.unwrap_or(now).max(now));
+                self.drive_due(now)
+            } else {
+                self.start_activity(now)
+            }
+        } else if matches!(self.mode, Mode::Busy | Mode::SettleOff) {
+            self.start_idle_after_activity(now)
+        } else {
+            self.start_recovery(now)
+        }
     }
 
     fn timeout(&mut self, now: Instant) -> io::Result<()> {
@@ -368,28 +393,30 @@ impl<R: IndicatorRenderer> Engine<R> {
 
     fn drive_due(&mut self, now: Instant) -> io::Result<()> {
         while self.enabled && self.deadline.is_some_and(|deadline| deadline <= now) {
-            if self.pending_activity_edge && self.attention.is_none() {
+            if self.pending_activity_edge {
                 self.set_lit(true, now)?;
                 self.pending_activity_edge = false;
-                if self.command_active {
-                    self.mode = Mode::Busy;
-                    self.deadline = Some(self.edge_time(now) + self.policy.busy.delay(self.lit));
+                self.activity_on_until =
+                    Some(self.edge_time(now) + self.policy.minimum_activity_on);
+                self.mode = if self.activity_running() {
+                    Mode::Busy
                 } else {
-                    self.start_idle_after_activity(now)?;
-                }
+                    Mode::SettleOff
+                };
+                self.deadline = if self.mode == Mode::Busy {
+                    Some(self.edge_time(now) + self.policy.busy.on)
+                } else {
+                    self.activity_on_until
+                };
                 continue;
             }
-
             match self.mode {
-                Mode::ActivitySeparator => {
-                    self.set_lit(false, now)?;
-                    self.pending_activity_edge = true;
-                    self.mode = Mode::Rest;
-                    self.deadline = Some(self.edge_ready(now));
-                }
                 Mode::Busy => {
-                    if self.command_active {
+                    if self.activity_running() {
                         self.toggle(now)?;
+                        self.activity_on_until = self
+                            .lit
+                            .then(|| self.edge_time(now) + self.policy.minimum_activity_on);
                         self.deadline =
                             Some(self.edge_time(now) + self.policy.busy.delay(self.lit));
                     } else {
@@ -398,12 +425,10 @@ impl<R: IndicatorRenderer> Engine<R> {
                 }
                 Mode::SettleOff => {
                     self.set_lit(false, now)?;
-                    if self.pending_activity_pulse {
-                        self.start_pending_pulse(now)?;
-                    } else {
-                        self.start_idle_after_activity(now)?;
-                    }
+                    self.activity_on_until = None;
+                    self.start_recovery(now)?;
                 }
+                Mode::Recovery => self.restart_background(now)?,
                 Mode::IdleOff => {
                     self.set_lit(true, now)?;
                     self.mode = Mode::IdleOn;
@@ -428,20 +453,12 @@ impl<R: IndicatorRenderer> Engine<R> {
                         }
                     }
                 }
-                Mode::AttentionWaitingOn => {
-                    let cadence = self.attention.expect("attention cadence");
-                    self.set_lit(true, now)?;
-                    self.mode = Mode::Attention;
-                    self.deadline = Some(self.edge_time(now) + cadence.on);
-                }
                 Mode::Attention => {
                     let cadence = self.attention.expect("attention cadence");
                     self.toggle(now)?;
                     self.deadline = Some(self.edge_time(now) + cadence.delay(self.lit));
                 }
-                Mode::Rest => {
-                    self.deadline = None;
-                }
+                Mode::Rest => self.deadline = None,
             }
         }
         Ok(())
@@ -457,12 +474,7 @@ impl<R: IndicatorRenderer> Engine<R> {
                 self.mode = Mode::IdleOff;
                 self.deadline = Some(now + cadence.off);
             }
-            IdlePolicy::Off
-            | IdlePolicy::Blink {
-                count: BlinkCount::Finite(_),
-                ..
-            } => {
-                self.idle_blinks_remaining = Some(0);
+            _ => {
                 self.mode = Mode::Rest;
                 self.deadline = None;
             }
@@ -472,56 +484,65 @@ impl<R: IndicatorRenderer> Engine<R> {
     fn start_idle_after_activity(&mut self, now: Instant) -> io::Result<()> {
         if self.lit {
             self.mode = Mode::SettleOff;
-            self.deadline = Some(self.edge_ready(now));
-            self.drive_due(now)?;
+            self.deadline = Some(self.activity_on_until.unwrap_or(now).max(now));
+            self.drive_due(now)
+        } else {
+            self.start_recovery(now)
+        }
+    }
+
+    fn start_recovery(&mut self, now: Instant) -> io::Result<()> {
+        self.set_lit(false, now)?;
+        self.activity_on_until = None;
+        self.activity_over_attention = false;
+        self.mode = Mode::Recovery;
+        self.deadline = Some(self.edge_time(now) + self.policy.minimum_edge);
+        Ok(())
+    }
+
+    fn restart_background(&mut self, now: Instant) -> io::Result<()> {
+        if let Some(cadence) = self.attention {
+            self.set_lit(true, now)?;
+            self.mode = Mode::Attention;
+            self.deadline = Some(self.edge_time(now) + cadence.on);
             return Ok(());
         }
-
-        if self.pending_activity_pulse {
-            self.start_pending_pulse(now)?;
-            return Ok(());
-        }
-
         match self.policy.idle {
             IdlePolicy::Off => {
                 self.mode = Mode::Rest;
                 self.deadline = None;
             }
-            IdlePolicy::Blink {
-                cadence: _,
-                count: BlinkCount::Finite(count),
-            } => {
-                self.idle_blinks_remaining = Some(count);
+            IdlePolicy::Blink { cadence, count } => {
+                self.idle_blinks_remaining = match count {
+                    BlinkCount::Finite(n) => Some(n),
+                    BlinkCount::Forever => None,
+                };
+                // Separate a completed activity pulse from idle blinking.
+                // A full off phase avoids making short work look like a long
+                // on pulse separated only by the minimum edge interval.
+                self.set_lit(false, now)?;
                 self.mode = Mode::IdleOff;
-                self.deadline = Some(self.edge_ready(now));
-                self.drive_due(now)?;
-            }
-            IdlePolicy::Blink {
-                cadence,
-                count: BlinkCount::Forever,
-            } => {
-                self.idle_blinks_remaining = None;
-                self.mode = Mode::IdleOff;
-                self.deadline = Some(self.edge_time(now) + cadence.off);
+                self.deadline = Some(now + cadence.off);
             }
         }
         Ok(())
     }
 
-    fn start_pending_pulse(&mut self, now: Instant) -> io::Result<()> {
-        self.pending_activity_pulse = false;
-        self.start_activity(now)
-    }
-
     fn start_activity(&mut self, now: Instant) -> io::Result<()> {
-        if self.lit {
-            self.mode = Mode::ActivitySeparator;
-        } else {
-            self.pending_activity_edge = true;
-            self.mode = Mode::Rest;
-        }
-        self.deadline = Some(self.edge_ready(now));
-        self.drive_due(now)
+        // Stop the background pattern and ensure a visible off interval. A
+        // recent off edge only needs its remaining time; an already-dark LED
+        // can start immediately once that minimum has elapsed. The command
+        // never waits, and the old idle timer cannot shorten the on phase.
+        self.set_lit(false, now)?;
+        self.pending_activity_edge = true;
+        self.activity_on_until = None;
+        self.mode = Mode::Rest;
+        self.deadline = Some(
+            self.last_edge
+                .map_or(now, |edge| edge + self.policy.minimum_activity_off)
+                .max(now),
+        );
+        Ok(())
     }
 
     fn idle_cadence(&self) -> Cadence {
@@ -531,21 +552,12 @@ impl<R: IndicatorRenderer> Engine<R> {
         cadence
     }
 
-    fn edge_ready(&self, now: Instant) -> Instant {
-        self.last_edge
-            .map(|edge| edge + self.policy.minimum_edge)
-            .unwrap_or(now)
-            .max(now)
-    }
-
     fn edge_time(&self, now: Instant) -> Instant {
         self.last_edge.unwrap_or(now).max(now)
     }
-
     fn toggle(&mut self, now: Instant) -> io::Result<()> {
         self.set_lit(!self.lit, now)
     }
-
     fn set_lit(&mut self, lit: bool, now: Instant) -> io::Result<()> {
         if self.lit != lit {
             let edge_started = Instant::now().max(now);
@@ -578,6 +590,11 @@ fn run(
             Ok(Some(command)) => command,
             Ok(None) => unreachable!(),
             Err(RecvTimeoutError::Timeout) => {
+                engine.observe_activity(
+                    activity_state.command_active.load(Ordering::Acquire),
+                    activity_state.command_epoch.load(Ordering::Acquire),
+                    Instant::now(),
+                )?;
                 engine.timeout(Instant::now())?;
                 continue;
             }
@@ -595,9 +612,21 @@ fn run(
                 )?;
             }
             Command::AttentionStarted(cadence) => {
+                engine.observe_activity(
+                    activity_state.command_active.load(Ordering::Acquire),
+                    activity_state.command_epoch.load(Ordering::Acquire),
+                    Instant::now(),
+                )?;
                 engine.attention_started(cadence, Instant::now())?;
             }
-            Command::AttentionEnded => engine.attention_ended(Instant::now())?,
+            Command::AttentionEnded => {
+                engine.observe_activity(
+                    activity_state.command_active.load(Ordering::Acquire),
+                    activity_state.command_epoch.load(Ordering::Acquire),
+                    Instant::now(),
+                )?;
+                engine.attention_ended(Instant::now())?;
+            }
             Command::SetEnabled(enabled, response) => {
                 let _ = response.send(engine.set_enabled(enabled, Instant::now()));
             }
@@ -612,6 +641,12 @@ fn stopped() -> io::Error {
 
 fn validate_policy(policy: Policy) -> io::Result<()> {
     validate_cadence(policy.busy)?;
+    if policy.minimum_activity_off < policy.minimum_edge
+        || policy.minimum_activity_on.is_zero()
+        || policy.minimum_activity_on > policy.busy.on
+    {
+        return Err(invalid_policy());
+    }
     match policy.idle {
         IdlePolicy::Off => Ok(()),
         IdlePolicy::Blink {
@@ -647,272 +682,434 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct RecordingRenderer(Arc<Mutex<Vec<bool>>>);
-
     impl IndicatorRenderer for RecordingRenderer {
         fn set_indicator(&mut self, lit: bool) -> io::Result<()> {
             self.0.lock().unwrap().push(lit);
             Ok(())
         }
     }
-
     fn policy(idle: IdlePolicy) -> Policy {
         Policy::new(
             Cadence::new(Duration::from_millis(67), Duration::from_millis(33)),
             idle,
             Duration::from_millis(8),
         )
+        .with_minimum_activity_on(Duration::from_micros(33_500))
+    }
+    fn idle(count: BlinkCount) -> IdlePolicy {
+        IdlePolicy::Blink {
+            cadence: Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500)),
+            count,
+        }
+    }
+    fn advance(engine: &mut Engine<RecordingRenderer>) -> Instant {
+        let due = engine.deadline.unwrap();
+        engine.timeout(due).unwrap();
+        due
     }
 
     #[test]
-    fn completed_short_command_is_followed_by_one_counted_idle_blink() {
+    fn completed_command_starts_immediately_when_dark_then_recovers() {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
-        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
-        let mut engine = Engine::new(
-            policy(IdlePolicy::Blink {
-                cadence: idle,
-                count: BlinkCount::Finite(1),
-            }),
-            renderer,
-        );
+        let mut engine = Engine::new(policy(IdlePolicy::Off), renderer);
         let start = Instant::now();
         engine.set_enabled(true, start).unwrap();
         engine.observe_activity(false, 1, start).unwrap();
+        assert!(engine.lit);
+        let on = engine.last_edge.unwrap();
         assert_eq!(*output.lock().unwrap(), vec![true]);
-        assert_eq!(engine.mode, Mode::SettleOff);
-
-        let activity_off = engine.deadline.unwrap();
-        engine.timeout(activity_off).unwrap();
+        assert_eq!(engine.deadline, Some(on + Duration::from_micros(33_500)));
+        engine.timeout(on + Duration::from_millis(33)).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true]);
+        let off = advance(&mut engine);
         assert_eq!(*output.lock().unwrap(), vec![true, false]);
-
-        let idle_on = engine.deadline.unwrap();
-        engine.timeout(idle_on).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true, false, true]);
-        let idle_off = engine.deadline.unwrap();
-        engine.timeout(idle_off).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
+        assert_eq!(engine.mode, Mode::Recovery);
+        assert_eq!(engine.deadline, Some(off + Duration::from_millis(8)));
+        advance(&mut engine);
         assert_eq!(engine.mode, Mode::Rest);
+        assert!(engine.deadline.is_none());
     }
-
     #[test]
-    fn sustained_command_uses_asymmetric_busy_cadence_then_counted_idle() {
+    fn completion_during_the_on_phase_does_not_truncate_it() {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
-        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
-        let mut engine = Engine::new(
-            policy(IdlePolicy::Blink {
-                cadence: idle,
-                count: BlinkCount::Finite(1),
-            }),
-            renderer,
-        );
+        let mut engine = Engine::new(policy(IdlePolicy::Off), renderer);
         let start = Instant::now();
         engine.set_enabled(true, start).unwrap();
         engine.observe_activity(true, 1, start).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true]);
-
-        let off_due = engine.deadline.unwrap();
-        engine.timeout(off_due).unwrap();
+        let on = engine.last_edge.unwrap();
+        engine
+            .observe_activity(false, 1, on + Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(engine.deadline, Some(on + Duration::from_micros(33_500)));
+        advance(&mut engine);
         assert_eq!(*output.lock().unwrap(), vec![true, false]);
-        let on_due = engine.deadline.unwrap();
-        engine.timeout(on_due).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true, false, true]);
-
-        let end = start + Duration::from_millis(110);
-        engine.observe_activity(false, 1, end).unwrap();
+    }
+    #[test]
+    fn sustained_activity_preserves_67_on_33_off_then_resumes_counted_idle() {
+        let renderer = RecordingRenderer::default();
+        let output = renderer.0.clone();
+        let mut engine = Engine::new(policy(idle(BlinkCount::Finite(1))), renderer);
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        engine.observe_activity(true, 1, start).unwrap();
+        let on1 = engine.last_edge.unwrap();
+        let off = advance(&mut engine);
+        assert_eq!(off - on1, Duration::from_millis(67));
+        let on2 = advance(&mut engine);
+        assert_eq!(on2 - off, Duration::from_millis(33));
+        engine
+            .observe_activity(false, 1, on2 + Duration::from_millis(10))
+            .unwrap();
+        let end = advance(&mut engine);
+        assert_eq!(end - on2, Duration::from_micros(33_500));
+        let recovery_end = advance(&mut engine);
+        assert_eq!(recovery_end - end, Duration::from_millis(8));
+        assert_eq!(engine.mode, Mode::IdleOff);
+        let idle_on = advance(&mut engine);
+        assert_eq!(idle_on - recovery_end, Duration::from_millis(1_500));
+        let idle_off = advance(&mut engine);
+        assert_eq!(idle_off - idle_on, Duration::from_millis(1_500));
+        assert_eq!(
+            *output.lock().unwrap(),
+            vec![true, false, true, false, true, false]
+        );
+        assert_eq!(engine.mode, Mode::Rest);
+    }
+    #[test]
+    fn activity_interrupts_long_idle_on_and_restarts_it_after_recovery() {
+        let renderer = RecordingRenderer::default();
+        let output = renderer.0.clone();
+        let mut engine = Engine::new(policy(idle(BlinkCount::Forever)), renderer);
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        advance(&mut engine);
+        engine
+            .observe_activity(false, 1, start + Duration::from_millis(2_000))
+            .unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true, false]);
+        let on = advance(&mut engine);
+        assert_eq!(on, start + Duration::from_millis(2_008));
+        let off = advance(&mut engine);
+        assert_eq!(off - on, Duration::from_micros(33_500));
+        let recovery_end = advance(&mut engine);
+        assert_eq!(recovery_end - off, Duration::from_millis(8));
+        assert_eq!(engine.mode, Mode::IdleOff);
         assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
-        let idle_on = engine.deadline.unwrap();
-        engine.timeout(idle_on).unwrap();
+        let idle_on = advance(&mut engine);
+        assert_eq!(idle_on - recovery_end, Duration::from_millis(1_500));
         assert_eq!(
             *output.lock().unwrap(),
             vec![true, false, true, false, true]
         );
+        assert_eq!(engine.mode, Mode::IdleOn);
+        assert_eq!(
+            engine.deadline,
+            Some(idle_on + Duration::from_millis(1_500))
+        );
+        let idle_off = advance(&mut engine);
+        assert_eq!(
+            engine.deadline,
+            Some(idle_off + Duration::from_millis(1_500))
+        );
+    }
+    #[test]
+    fn completed_short_commands_leave_idle_dark_for_its_full_off_phase() {
+        for count in [BlinkCount::Finite(1), BlinkCount::Forever] {
+            let renderer = RecordingRenderer::default();
+            let output = renderer.0.clone();
+            let mut engine = Engine::new(policy(idle(count)), renderer);
+            let start = Instant::now();
+            engine.set_enabled(true, start).unwrap();
+            engine.observe_activity(false, 1, start).unwrap();
+            let on = engine.last_edge.unwrap();
+            let off = advance(&mut engine);
+            assert_eq!(off - on, Duration::from_micros(33_500));
+            let recovery_end = advance(&mut engine);
+            assert_eq!(recovery_end - off, Duration::from_millis(8));
+            assert_eq!(engine.mode, Mode::IdleOff);
+            for elapsed in [10, 100, 1_499] {
+                engine
+                    .timeout(recovery_end + Duration::from_millis(elapsed))
+                    .unwrap();
+                assert!(!engine.lit);
+                assert_eq!(*output.lock().unwrap(), vec![true, false]);
+            }
+            let idle_on = advance(&mut engine);
+            assert_eq!(idle_on - recovery_end, Duration::from_millis(1_500));
+            assert_eq!(*output.lock().unwrap(), vec![true, false, true]);
+            let idle_off = advance(&mut engine);
+            assert_eq!(idle_off - idle_on, Duration::from_millis(1_500));
+            assert_eq!(
+                engine.mode,
+                if count == BlinkCount::Finite(1) {
+                    Mode::Rest
+                } else {
+                    Mode::IdleOff
+                }
+            );
+        }
     }
 
     #[test]
-    fn periodic_idle_continues_but_disable_only_forces_indicator_off() {
+    fn visible_interruption_notch_only_delays_activity_over_a_lit_background() {
+        for was_lit in [false, true] {
+            let mut engine = Engine::new(
+                policy(idle(BlinkCount::Forever))
+                    .with_minimum_activity_off(Duration::from_millis(16)),
+                RecordingRenderer::default(),
+            );
+            let start = Instant::now();
+            engine.set_enabled(true, start).unwrap();
+            let work = if was_lit {
+                advance(&mut engine);
+                start + Duration::from_millis(2_000)
+            } else {
+                start + Duration::from_millis(100)
+            };
+            assert_eq!(engine.lit, was_lit);
+            engine.observe_activity(false, 1, work).unwrap();
+            let deadline = engine.deadline;
+            // Collapsed commands cannot extend the notch or queue extra pulses.
+            engine
+                .observe_activity(false, 2, work + Duration::from_millis(2))
+                .unwrap();
+            assert_eq!(engine.deadline, deadline);
+            let on = if was_lit {
+                assert!(!engine.lit);
+                assert_eq!(deadline, Some(work + Duration::from_millis(16)));
+                engine
+                    .timeout(work + Duration::from_micros(15_999))
+                    .unwrap();
+                assert!(!engine.lit);
+                advance(&mut engine)
+            } else {
+                assert!(engine.lit);
+                assert_eq!(engine.last_edge, Some(work));
+                work
+            };
+            assert!(engine.lit);
+            let off = advance(&mut engine);
+            assert_eq!(off - on, Duration::from_micros(33_500));
+            let recovered = advance(&mut engine);
+            assert_eq!(recovered - off, Duration::from_millis(8));
+            assert_eq!(engine.mode, Mode::IdleOff);
+            assert_eq!(
+                engine.deadline,
+                Some(recovered + Duration::from_millis(1_500))
+            );
+        }
+    }
+
+    #[test]
+    fn activity_reuses_elapsed_off_time_without_losing_the_visible_gap() {
+        for elapsed_us in [0, 5_000, 15_999, 16_000, 20_000] {
+            let mut engine = Engine::new(
+                policy(idle(BlinkCount::Forever))
+                    .with_minimum_activity_off(Duration::from_millis(16)),
+                RecordingRenderer::default(),
+            );
+            let start = Instant::now();
+            engine.set_enabled(true, start).unwrap();
+            advance(&mut engine); // idle on
+            let off = advance(&mut engine); // idle off
+            let work = off + Duration::from_micros(elapsed_us);
+            engine.observe_activity(false, 1, work).unwrap();
+            let on = if elapsed_us < 16_000 {
+                assert!(!engine.lit);
+                assert_eq!(engine.last_edge, Some(off));
+                assert_eq!(engine.deadline, Some(off + Duration::from_millis(16)));
+                advance(&mut engine)
+            } else {
+                assert!(engine.lit);
+                assert_eq!(engine.last_edge, Some(work));
+                work
+            };
+            assert_eq!(on, (off + Duration::from_millis(16)).max(work));
+            assert_eq!(engine.deadline, Some(on + Duration::from_micros(33_500)));
+        }
+    }
+
+    #[test]
+    fn minimum_activity_off_cannot_be_shorter_than_the_minimum_edge() {
+        let invalid = policy(IdlePolicy::Off).with_minimum_activity_off(Duration::from_millis(7));
+        assert!(validate_policy(invalid).is_err());
+        assert!(validate_policy(policy(IdlePolicy::Off)).is_ok());
+    }
+
+    #[test]
+    fn activity_interrupts_idle_off_immediately() {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
-        let mut engine = Engine::new(
-            policy(IdlePolicy::Blink {
-                cadence: Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500)),
-                count: BlinkCount::Forever,
-            }),
-            renderer,
-        );
+        let mut engine = Engine::new(policy(idle(BlinkCount::Forever)), renderer);
         let start = Instant::now();
         engine.set_enabled(true, start).unwrap();
-        let idle_due = engine.deadline.unwrap();
-        engine.timeout(idle_due).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true]);
-
         engine
-            .set_enabled(false, start + Duration::from_secs(2))
+            .observe_activity(false, 1, start + Duration::from_millis(100))
             .unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true, false]);
-        assert!(!engine.enabled);
+        assert!(engine.lit);
+        assert_eq!(engine.last_edge, Some(start + Duration::from_millis(100)));
+        assert_eq!(
+            engine.deadline,
+            Some(start + Duration::from_micros(133_500))
+        );
+        assert_eq!(*output.lock().unwrap(), vec![true]);
     }
-
     #[test]
-    fn activity_burst_retains_only_one_additional_pulse() {
+    fn bursts_coalesce_without_extending_or_replaying_the_pulse() {
+        for base in [IdlePolicy::Off, idle(BlinkCount::Forever)] {
+            let renderer = RecordingRenderer::default();
+            let output = renderer.0.clone();
+            let mut engine = Engine::new(policy(base), renderer);
+            let start = Instant::now();
+            engine.set_enabled(true, start).unwrap();
+            engine.observe_activity(false, 4, start).unwrap();
+            let on = engine.last_edge.unwrap();
+            let deadline = engine.deadline;
+            for epoch in 5..100 {
+                engine
+                    .observe_activity(false, epoch, on + Duration::from_millis(2))
+                    .unwrap();
+                assert_eq!(engine.deadline, deadline);
+            }
+            let off = advance(&mut engine);
+            assert_eq!(off - on, Duration::from_micros(33_500));
+            assert_eq!(*output.lock().unwrap(), vec![true, false]);
+            advance(&mut engine);
+            assert_eq!(
+                engine.mode,
+                if base == IdlePolicy::Off {
+                    Mode::Rest
+                } else {
+                    Mode::IdleOff
+                }
+            );
+        }
+    }
+    #[test]
+    fn completion_after_minimum_ends_immediately() {
+        let mut engine = Engine::new(policy(IdlePolicy::Off), RecordingRenderer::default());
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        engine.observe_activity(true, 1, start).unwrap();
+        let on = engine.last_edge.unwrap();
+        let end = on + Duration::from_millis(40);
+        engine.observe_activity(false, 1, end).unwrap();
+        assert!(!engine.lit);
+        assert_eq!(engine.mode, Mode::Recovery);
+        assert_eq!(engine.deadline, Some(end + Duration::from_millis(8)));
+    }
+    #[test]
+    fn new_work_during_minimum_resumes_busy_without_delayed_replay() {
+        let mut engine = Engine::new(policy(IdlePolicy::Off), RecordingRenderer::default());
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        engine.observe_activity(false, 1, start).unwrap();
+        let on = engine.last_edge.unwrap();
+        engine
+            .observe_activity(true, 2, on + Duration::from_millis(10))
+            .unwrap();
+        assert_eq!(engine.mode, Mode::Busy);
+        assert_eq!(engine.deadline, Some(on + Duration::from_millis(67)));
+        engine
+            .observe_activity(false, 2, on + Duration::from_millis(20))
+            .unwrap();
+        assert_eq!(engine.deadline, Some(on + Duration::from_micros(33_500)));
+        advance(&mut engine);
+        advance(&mut engine);
+        assert_eq!(engine.mode, Mode::Rest);
+    }
+    #[test]
+    fn touch_wait_replaces_busy_after_its_minimum_phase_and_work_can_interrupt_touch() {
+        let renderer = RecordingRenderer::default();
+        let output = renderer.0.clone();
+        let mut engine = Engine::new(policy(IdlePolicy::Off), renderer);
+        let start = Instant::now();
+        let touch = Cadence::new(Duration::from_millis(384), Duration::from_millis(384));
+        engine.set_enabled(true, start).unwrap();
+        engine.observe_activity(true, 1, start).unwrap();
+        engine.attention_started(touch, start).unwrap();
+        let on1 = engine.last_edge.unwrap();
+        let off1 = advance(&mut engine);
+        assert_eq!(off1 - on1, Duration::from_micros(33_500));
+        let touch_on = advance(&mut engine);
+        assert_eq!(touch_on - off1, Duration::from_millis(8));
+        assert_eq!(engine.mode, Mode::Attention);
+        assert_eq!(engine.deadline, Some(touch_on + touch.on));
+        // A later command has already completed while the touch pattern is lit.
+        let work = touch_on + Duration::from_millis(20);
+        engine.observe_activity(false, 2, work).unwrap();
+        assert!(!engine.lit);
+        let on2 = advance(&mut engine);
+        assert_eq!(on2 - work, Duration::from_millis(8));
+        let off2 = advance(&mut engine);
+        assert_eq!(off2 - on2, Duration::from_micros(33_500));
+        let resume = advance(&mut engine);
+        assert_eq!(resume - off2, Duration::from_millis(8));
+        assert_eq!(engine.mode, Mode::Attention);
+        assert_eq!(engine.deadline, Some(resume + touch.on));
+        let touch_off = advance(&mut engine);
+        assert_eq!(touch_off - resume, touch.on);
+        assert_eq!(engine.deadline, Some(touch_off + touch.off));
+        assert_eq!(
+            *output.lock().unwrap(),
+            vec![true, false, true, false, true, false, true, false]
+        );
+    }
+    #[test]
+    fn ending_touch_restarts_work_with_an_off_boundary() {
+        let renderer = RecordingRenderer::default();
+        let mut engine = Engine::new(policy(IdlePolicy::Off), renderer);
+        let start = Instant::now();
+        engine.set_enabled(true, start).unwrap();
+        engine.observe_activity(true, 1, start).unwrap();
+        engine
+            .attention_started(
+                Cadence::new(Duration::from_millis(384), Duration::from_millis(384)),
+                start,
+            )
+            .unwrap();
+        for _ in 0..2 {
+            advance(&mut engine);
+        }
+        assert!(engine.lit);
+        let end = engine.last_edge.unwrap() + Duration::from_millis(20);
+        engine.attention_ended(end).unwrap();
+        assert!(!engine.lit);
+        assert_eq!(engine.deadline, Some(end + Duration::from_millis(8)));
+        advance(&mut engine);
+        assert_eq!(engine.mode, Mode::Busy);
+    }
+    #[test]
+    fn disable_cancels_activity_and_prevents_later_replay() {
         let renderer = RecordingRenderer::default();
         let output = renderer.0.clone();
         let mut engine = Engine::new(policy(IdlePolicy::Off), renderer);
         let start = Instant::now();
         engine.set_enabled(true, start).unwrap();
-        engine.observe_activity(false, 4, start).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true]);
-        assert_eq!(engine.seen_epoch, 4);
-        assert!(!engine.pending_activity_edge);
-        assert!(engine.pending_activity_pulse);
-
-        let first_off = engine.deadline.unwrap();
-        engine.timeout(first_off).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true, false]);
-        assert!(engine.pending_activity_edge);
-        assert!(!engine.pending_activity_pulse);
-
-        let second_on = engine.deadline.unwrap();
-        engine.timeout(second_on).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true, false, true]);
-        let second_off = engine.deadline.unwrap();
-        engine.timeout(second_off).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
-        assert_eq!(engine.mode, Mode::Rest);
-    }
-
-    #[test]
-    fn periodic_idle_short_command_finishes_off_before_idle_restarts() {
-        let renderer = RecordingRenderer::default();
-        let output = renderer.0.clone();
-        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
-        let mut engine = Engine::new(
-            policy(IdlePolicy::Blink {
-                cadence: idle,
-                count: BlinkCount::Forever,
-            }),
-            renderer,
-        );
-        let start = Instant::now();
-        engine.set_enabled(true, start).unwrap();
         engine.observe_activity(false, 1, start).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true]);
-
-        let completion = engine.deadline.unwrap();
-        engine.timeout(completion).unwrap();
+        let on = engine.last_edge.unwrap();
+        engine
+            .set_enabled(false, on + Duration::from_millis(1))
+            .unwrap();
         assert_eq!(*output.lock().unwrap(), vec![true, false]);
-        assert_eq!(engine.mode, Mode::IdleOff);
+        assert!(engine.deadline.is_none());
+        engine.timeout(on + Duration::from_secs(1)).unwrap();
+        assert_eq!(*output.lock().unwrap(), vec![true, false]);
     }
-
     #[test]
-    fn periodic_idle_on_inserts_an_off_separator_before_activity_on() {
-        let renderer = RecordingRenderer::default();
-        let output = renderer.0.clone();
-        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
-        let mut engine = Engine::new(
-            policy(IdlePolicy::Blink {
-                cadence: idle,
-                count: BlinkCount::Forever,
-            }),
-            renderer,
-        );
-        let start = Instant::now();
-        engine.set_enabled(true, start).unwrap();
-        let idle_on = engine.deadline.unwrap();
-        engine.timeout(idle_on).unwrap();
-        engine.observe_activity(false, 1, idle_on).unwrap();
-
-        for _ in 0..3 {
-            let deadline = engine.deadline.unwrap();
-            engine.timeout(deadline).unwrap();
-        }
-        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
-        assert_eq!(engine.mode, Mode::IdleOff);
-    }
-
-    #[test]
-    fn periodic_idle_burst_retains_only_one_complete_extra_pulse() {
-        let renderer = RecordingRenderer::default();
-        let output = renderer.0.clone();
-        let idle = Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
-        let mut engine = Engine::new(
-            policy(IdlePolicy::Blink {
-                cadence: idle,
-                count: BlinkCount::Forever,
-            }),
-            renderer,
-        );
-        let start = Instant::now();
-        engine.set_enabled(true, start).unwrap();
-        engine.observe_activity(false, 8, start).unwrap();
-
-        for _ in 0..3 {
-            let deadline = engine.deadline.unwrap();
-            engine.timeout(deadline).unwrap();
-        }
-        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
-        assert_eq!(engine.mode, Mode::IdleOff);
-    }
-
-    #[test]
-    fn activity_during_a_visible_pulse_retains_one_more_pulse() {
-        let renderer = RecordingRenderer::default();
-        let output = renderer.0.clone();
-        let mut engine = Engine::new(policy(IdlePolicy::Off), renderer);
-        let start = Instant::now();
-        engine.set_enabled(true, start).unwrap();
-        engine.observe_activity(false, 1, start).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true]);
-
-        engine
-            .observe_activity(false, 2, start + Duration::from_millis(1))
-            .unwrap();
-        engine
-            .observe_activity(false, 8, start + Duration::from_millis(2))
-            .unwrap();
-        assert!(engine.pending_activity_pulse);
-
-        for _ in 0..3 {
-            let deadline = engine.deadline.unwrap();
-            engine.timeout(deadline).unwrap();
-        }
-        assert_eq!(*output.lock().unwrap(), vec![true, false, true, false]);
-        assert_eq!(engine.mode, Mode::Rest);
-    }
-
-    #[test]
-    fn renderer_time_is_part_of_the_minimum_edge_interval() {
-        let render_time = Duration::from_millis(12);
-        let mut engine = Engine::new(policy(IdlePolicy::Off), move |_| {
-            thread::sleep(render_time);
+    fn rendering_time_counts_toward_the_on_phase() {
+        let mut engine = Engine::new(policy(IdlePolicy::Off), |_| {
+            thread::sleep(Duration::from_millis(80));
             Ok(())
         });
         let start = Instant::now();
         engine.set_enabled(true, start).unwrap();
         engine.observe_activity(false, 1, start).unwrap();
-
+        assert!(engine.lit);
         assert!(engine.deadline.unwrap() <= Instant::now());
     }
-
-    #[test]
-    fn attention_overrides_busy_and_resumes_it() {
-        let renderer = RecordingRenderer::default();
-        let output = renderer.0.clone();
-        let mut engine = Engine::new(policy(IdlePolicy::Off), renderer);
-        let start = Instant::now();
-        let attention = Cadence::new(Duration::from_millis(384), Duration::from_millis(384));
-        engine.set_enabled(true, start).unwrap();
-        engine.observe_activity(true, 1, start).unwrap();
-        engine.attention_started(attention, start).unwrap();
-        let attention_due = engine.deadline.unwrap();
-        engine.timeout(attention_due).unwrap();
-        assert_eq!(*output.lock().unwrap(), vec![true, false]);
-        engine
-            .attention_ended(start + Duration::from_millis(400))
-            .unwrap();
-        assert_eq!(engine.mode, Mode::Busy);
-    }
-
     #[test]
     fn controller_preserves_a_command_that_completes_before_its_wake() {
         let (sender, receiver) = mpsc::channel();
@@ -930,26 +1127,64 @@ mod tests {
         )
         .unwrap();
         controller.enable().unwrap();
-
         drop(controller.activity().begin());
         assert!(receiver.recv_timeout(Duration::from_secs(1)).unwrap());
         assert!(!receiver.recv_timeout(Duration::from_secs(1)).unwrap());
         controller.shutdown().unwrap();
     }
-
+    #[test]
+    fn command_producer_does_not_wait_for_a_blocked_renderer() {
+        let (entered, observed) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let controller = Controller::start(
+            policy(IdlePolicy::Off),
+            move |lit| {
+                if lit {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                }
+                Ok(())
+            },
+            "blocked-indicator-test",
+        )
+        .unwrap();
+        controller.enable().unwrap();
+        let activity = controller.activity();
+        drop(activity.begin());
+        observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (finished, done) = mpsc::channel();
+        let producer = thread::spawn(move || {
+            for _ in 0..100 {
+                drop(activity.begin());
+            }
+            finished.send(()).unwrap();
+        });
+        let result = done.recv_timeout(Duration::from_secs(1));
+        release.send(()).unwrap();
+        producer.join().unwrap();
+        controller.shutdown().unwrap();
+        assert!(result.is_ok());
+    }
     #[test]
     fn zero_length_cadences_are_rejected() {
-        let policy = Policy::new(
-            Cadence::new(Duration::ZERO, Duration::from_millis(1)),
-            IdlePolicy::Off,
-            Duration::ZERO,
+        assert!(
+            validate_policy(Policy::new(
+                Cadence::new(Duration::ZERO, Duration::from_millis(1)),
+                IdlePolicy::Off,
+                Duration::from_millis(1)
+            ))
+            .is_err()
         );
-        assert_eq!(
-            Controller::start(policy, |_| Ok(()), "invalid")
-                .err()
-                .unwrap()
-                .kind(),
-            io::ErrorKind::InvalidInput
+        assert!(validate_policy(policy(idle(BlinkCount::Finite(0)))).is_err());
+        assert!(
+            validate_policy(policy(IdlePolicy::Off).with_minimum_activity_on(Duration::ZERO))
+                .is_err()
+        );
+        assert!(
+            validate_policy(
+                policy(IdlePolicy::Off).with_minimum_activity_on(Duration::from_millis(68))
+            )
+            .is_err()
         );
     }
 }

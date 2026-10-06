@@ -50,17 +50,25 @@ select complete on/off frames, update one region, or drive a physical LED.
 An activity handle marks the worker's single command as active and increments a
 monotonic command epoch when work starts. The epoch preserves evidence of a
 command that starts and finishes during a synchronous frame write. Activity
-that arrives while a pulse is already visible may retain one additional pulse;
-further activity coalesces rather than building a replay queue. Policies select
-the busy cadence, minimum edge interval, and an idle behavior: stopped off or a
-blink cadence repeated a finite number of times or forever. A finite count runs
-after activity; a forever cadence also starts when the indicator is enabled. A
-scoped attention cadence can temporarily override command and idle scheduling.
+coalesces into the current indication without extending its minimum on time or
+queuing replay pulses. Command producers never wait for rendering. Policies
+select the busy cadence, a separate minimum activity on time, the off boundary,
+and an idle behavior: stopped off or a blink cadence repeated a finite number
+of times or forever. A finite count runs after activity; a forever cadence also
+starts when the indicator is enabled. A scoped attention cadence represents
+background attention while a command waits, and later work can interrupt it.
 
-Activity always establishes an on phase. If blinking idle is already on, the
-scheduler inserts a minimum-length off separator before activity turns on. A
-short command finishes off; a sustained command continues directly into the
-busy cadence. Any configured idle blinking then restarts from off.
+Activity interrupts background blinking immediately. A minimum activity-off
+interval ensures a visible gap before the activity on phase. A lit background
+first turns off; an already-dark indicator reuses the time since its last off
+edge and waits only for any remaining interval. If that minimum has already
+elapsed, activity turns on immediately. Completed activity stays on for the
+configured minimum, then turns off without replaying completed commands. Sustained work
+uses the busy cadence; when it ends, the current on phase only needs to satisfy
+the minimum activity on time. After a final off boundary, idle blinking
+restarts with a full off phase so its long on phase cannot appear to extend a
+short activity pulse. Scoped attention resumes with its on phase after that
+boundary. With no background pattern, the indicator stays off.
 
 Cadence and minimum-edge intervals are measured from the start of one renderer
 call to the start of the next. Rendering time is therefore part of the interval,
