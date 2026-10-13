@@ -107,9 +107,14 @@ The ignored `physical_i2c_display_updates` qualification test targets address
 pattern has an `I2C TEST` heading, a border, a checkerboard, a cross, and four
 final dotted footer markers. Set
 `DISPLAY_TEST_BUS`, `DISPLAY_TEST_CONTROLLER` (`ssd1306` or `sh1106`), and
-`DISPLAY_TEST_EXPECTED` before invoking it with `--ignored`. Pair it with the
-target repository's SDL readback shim to compare the rendered pixels with the
-expected final framebuffer. It is never run by ordinary tests or CI.
+`DISPLAY_TEST_EXPECTED` before invoking it with `--ignored`. Use the ordinary
+target viewer for the real-bus test and check its received-byte and update
+counts, error counters, and visible pattern. The target repository's GPU
+readback shim is reserved for isolated pixel diagnostics; it adds synchronous
+GPU work that can perturb target FIFO servicing. The saved framebuffer can
+also be supplied unchanged through `write_frame` to a physical SPI panel for
+a visual layout comparison. The hardware test is never run by ordinary tests
+or CI.
 
 The C ABI is declared in `include/display_backends.h`; Linux builds produce
 both `target/release/libdisplay_backends.a` and
