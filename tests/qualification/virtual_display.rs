@@ -75,7 +75,7 @@ fn native_sh1106_commands_and_viewer_write_identical_pixels() {
     let mut converter = DisplayConverter::new(backend);
     converter.assume_blank();
     let mut native_ram = [0u8; 8 * 132];
-    let mut frame = [0; MONO1_FRAME_SIZE];
+    let mut frame = labelled_frame("sh1106");
     let mut parser = DisplayParser::new(DisplayController::Sh1106);
     for (page, x, width) in [(0, 0, 1), (2, 10, 3), (7, 127, 1), (1, 0, 128)] {
         for col in x..x + width {
@@ -113,7 +113,6 @@ fn native_sh1106_commands_and_viewer_write_identical_pixels() {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn labelled_frame(controller: &str) -> [u8; MONO1_FRAME_SIZE] {
     fn pixel(frame: &mut [u8; MONO1_FRAME_SIZE], x: usize, y: usize) {
         // Native SH1106/SSD1306 orientation is reversed on both axes.
@@ -166,7 +165,7 @@ fn labelled_frame(controller: &str) -> [u8; MONO1_FRAME_SIZE] {
     }
     text(&mut frame, "I2C TEST", 16, 5, 2);
     text(&mut frame, &controller.to_ascii_uppercase(), 70, 23, 1);
-    for y in 27..55 {
+    for y in 27usize..55 {
         for x in 8..56 {
             if ((x - 8) / 4 + (y - 27) / 4).is_multiple_of(2) {
                 pixel(&mut frame, x, y);
@@ -223,7 +222,7 @@ fn physical_i2c_display_updates() {
     let mut frame = labelled_frame(&controller);
     let mut messages_sent = 0usize;
     let mut bytes_sent = init.len() + if backend == Backend::Sh1106I2c { 2 } else { 0 };
-    for step in 0..=200 {
+    for step in 0usize..=200 {
         if step != 0 {
             // Paired changes span every page while preserving a readable final
             // pattern. Four final one-byte changes leave dotted footer markers.
