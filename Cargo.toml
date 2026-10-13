@@ -11,6 +11,8 @@ publish = false
 crate-type = ["rlib", "staticlib", "cdylib"]
 
 [features]
+# Optional cross-repository wire compatibility checks; requires sibling checkout.
+virtual-display-qualification = []
 demo = ["dep:embedded-graphics"]
 
 [dependencies]

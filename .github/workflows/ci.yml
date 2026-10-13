@@ -13,10 +13,21 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: display-backends
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          path: display-backends
+
+      - name: Check out virtual display wire consumer
+        uses: actions/checkout@v7
+        with:
+          repository: qpernil/raspberry-pi-i2c-target
+          path: raspberry-pi-i2c-target
 
       - name: Run tests
         run: cargo test --locked --all-features

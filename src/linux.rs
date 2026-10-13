@@ -2,8 +2,8 @@
 
 use crate::{
     Backend, DisplayConverter, FrameFormat, MONO1_FRAME_STRIDE, SH1106_DISPLAY_ON, SH1106_INIT,
-    SSD1306_INIT, ST7789_INIT, ST7789_PANEL_WIDTH, UpdateRect, sh1106_page_address,
-    ssd1306_address, st7789_window,
+    SSD1306_INIT, ST7789_INIT, ST7789_PANEL_WIDTH, UpdateRect, oled_i2c_messages,
+    sh1106_page_address, st7789_window,
 };
 use gpiocdev_uapi::v2::{LineValues, set_line_values};
 use spidev::{SpiModeFlags, Spidev, SpidevOptions};
@@ -166,16 +166,11 @@ impl Display {
         debug_assert_eq!(rect.height % 8, 0);
         let first_page = rect.y / 8;
         let pages = rect.height / 8;
-        if self.backend == Backend::Ssd1306I2c {
-            self.write_bus(&ssd1306_address(rect))?;
-            let mut message = Vec::with_capacity(1 + rect.width * pages);
-            message.push(0x40);
-            for page in first_page..first_page + pages {
-                let offset = page * MONO1_FRAME_STRIDE + rect.x;
-                message
-                    .extend_from_slice(&self.converter.next_frame()[offset..offset + rect.width]);
+        if !self.backend.uses_spi() {
+            for message in oled_i2c_messages(self.backend, rect, self.converter.next_frame()) {
+                self.write_bus(&message)?;
             }
-            return self.write_bus(&message);
+            return Ok(());
         }
         for page in first_page..first_page + pages {
             self.write_oled_message(&sh1106_page_address(page, rect.x))?;
