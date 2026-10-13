@@ -113,6 +113,76 @@ fn native_sh1106_commands_and_viewer_write_identical_pixels() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn labelled_frame(controller: &str) -> [u8; MONO1_FRAME_SIZE] {
+    fn pixel(frame: &mut [u8; MONO1_FRAME_SIZE], x: usize, y: usize) {
+        // Native SH1106/SSD1306 orientation is reversed on both axes.
+        let sy = 63 - y;
+        frame[(sy / 8) * 128 + 127 - x] |= 1 << (sy % 8);
+    }
+    fn text(frame: &mut [u8; MONO1_FRAME_SIZE], value: &str, x: usize, y: usize, scale: usize) {
+        for (letter, character) in value.chars().enumerate() {
+            let rows = match character {
+                'I' => [31, 4, 4, 4, 4, 4, 31],
+                '2' => [14, 17, 1, 2, 4, 8, 31],
+                'C' => [14, 17, 16, 16, 16, 17, 14],
+                'T' => [31, 4, 4, 4, 4, 4, 4],
+                'E' => [31, 16, 16, 30, 16, 16, 31],
+                'S' => [15, 16, 16, 14, 1, 1, 30],
+                'H' => [17, 17, 17, 31, 17, 17, 17],
+                'D' => [30, 17, 17, 17, 17, 17, 30],
+                '0' => [14, 17, 19, 21, 25, 17, 14],
+                '1' => [4, 12, 4, 4, 4, 4, 14],
+                '3' => [30, 1, 1, 14, 1, 1, 30],
+                '6' => [14, 16, 16, 30, 17, 17, 14],
+                ' ' => [0; 7],
+                _ => unreachable!(),
+            };
+            for (row, bits) in rows.into_iter().enumerate() {
+                for column in 0..5 {
+                    if bits & (1 << (4 - column)) != 0 {
+                        for dy in 0..scale {
+                            for dx in 0..scale {
+                                pixel(
+                                    frame,
+                                    x + letter * 6 * scale + column * scale + dx,
+                                    y + row * scale + dy,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut frame = [0; MONO1_FRAME_SIZE];
+    for x in 0..128 {
+        pixel(&mut frame, x, 0);
+        pixel(&mut frame, x, 63);
+    }
+    for y in 0..64 {
+        pixel(&mut frame, 0, y);
+        pixel(&mut frame, 127, y);
+    }
+    text(&mut frame, "I2C TEST", 16, 5, 2);
+    text(&mut frame, &controller.to_ascii_uppercase(), 70, 23, 1);
+    for y in 27..55 {
+        for x in 8..56 {
+            if ((x - 8) / 4 + (y - 27) / 4).is_multiple_of(2) {
+                pixel(&mut frame, x, y);
+            }
+        }
+    }
+    for y in 32..55 {
+        for x in 76..120 {
+            if (96..99).contains(&x) || (42..45).contains(&y) {
+                pixel(&mut frame, x, y);
+            }
+        }
+    }
+    frame
+}
+
 /// Opt-in real-bus qualification, targeting only the OLED address 0x3c.
 /// Pair this with virtual-display and tests/sdl_capture.c on the target Pi.
 #[cfg(target_os = "linux")]
@@ -150,16 +220,19 @@ fn physical_i2c_display_updates() {
         bus.write_all(crate::SH1106_DISPLAY_ON).unwrap();
     }
     let mut converter = DisplayConverter::new(backend);
-    let mut frame = [0; MONO1_FRAME_SIZE];
-    for (i, byte) in frame.iter_mut().enumerate() {
-        *byte = (i as u8).wrapping_mul(37).wrapping_add(0x40);
-    }
+    let mut frame = labelled_frame(&controller);
     let mut messages_sent = 0usize;
     let mut bytes_sent = init.len() + if backend == Backend::Sh1106I2c { 2 } else { 0 };
     for step in 0..=200 {
         if step != 0 {
-            // Repeated small writes span all pages and both horizontal edges.
-            let index = (step * 127 + step / 8) % MONO1_FRAME_SIZE;
+            // Paired changes span every page while preserving a readable final
+            // pattern. Four final one-byte changes leave dotted footer markers.
+            let index = if step <= 196 {
+                let pair = step.div_ceil(2);
+                (pair * 127 + pair / 8) % MONO1_FRAME_SIZE
+            } else {
+                [15, 40, 70, 100][step - 197]
+            };
             frame[index] ^= 0x5a;
         }
         let messages = wire_update(&mut converter, backend, &frame);

@@ -103,7 +103,9 @@ cargo test --locked --features virtual-display-qualification
 
 The ignored `physical_i2c_display_updates` qualification test targets address
 `0x3c` on an explicitly selected Linux bus. It sends one full frame followed by
-200 one-byte pixel changes using the production I2C message builder. Set
+200 one-byte pixel changes using the production I2C message builder. The visible
+pattern has an `I2C TEST` heading, a border, a checkerboard, a cross, and four
+final dotted footer markers. Set
 `DISPLAY_TEST_BUS`, `DISPLAY_TEST_CONTROLLER` (`ssd1306` or `sh1106`), and
 `DISPLAY_TEST_EXPECTED` before invoking it with `--ignored`. Pair it with the
 target repository's SDL readback shim to compare the rendered pixels with the
