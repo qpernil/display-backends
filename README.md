@@ -31,7 +31,14 @@ Each backend keeps the last successfully displayed native frame and compares it
 with the next complete native frame. An unchanged frame produces no bus traffic.
 For ST7789, the backend sends the smallest pixel-aligned bounding rectangle that
 contains every change. SSD1306 and SH1106 use the smallest changed column range
-and the changed eight-pixel controller pages. The new frame becomes current only
+and the changed eight-pixel controller pages. SH1106 I2C sends two extra native
+column-address commands per changed page: the ending column followed by the
+starting column. A physical controller ends at the starting address before
+receiving pixels; `virtual-display` uses the pair as an exact length hint.
+Both receive the same bytes, with no virtual-only envelope. SPI retains the
+ordinary starting-column commands. These are standard column-address operations
+from the [SH1106 command set](https://www.displayfuture.com/Display/datasheet/controller/SH1106.pdf),
+not additional controller opcodes. The new frame becomes current only
 after the entire transfer succeeds, so an interrupted update is retried against
 the last known-good display state.
 
@@ -84,6 +91,23 @@ cargo test --locked
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
+
+The optional `virtual-display-qualification` feature runs producer/consumer
+wire tests against a sibling `raspberry-pi-i2c-target` checkout. It verifies
+minimal pixel payloads, merged and fragmented records, and equivalence to
+native SH1106 command execution:
+
+```sh
+cargo test --locked --features virtual-display-qualification
+```
+
+The ignored `physical_i2c_display_updates` qualification test targets address
+`0x3c` on an explicitly selected Linux bus. It sends one full frame followed by
+200 one-byte pixel changes using the production I2C message builder. Set
+`DISPLAY_TEST_BUS`, `DISPLAY_TEST_CONTROLLER` (`ssd1306` or `sh1106`), and
+`DISPLAY_TEST_EXPECTED` before invoking it with `--ignored`. Pair it with the
+target repository's SDL readback shim to compare the rendered pixels with the
+expected final framebuffer. It is never run by ordinary tests or CI.
 
 The C ABI is declared in `include/display_backends.h`; Linux builds produce
 both `target/release/libdisplay_backends.a` and

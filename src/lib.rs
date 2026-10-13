@@ -404,6 +404,36 @@ pub(crate) fn ssd1306_address(rect: UpdateRect) -> [u8; 7] {
     ]
 }
 
+/// SH1106 I2C updates set the ending column and then the starting column.
+/// Both are native commands; physical displays finish at the starting column.
+/// The redundant address pair gives receive-only emulators an exact byte count
+/// even when the BSC driver merges or fragments adjacent I2C writes.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn oled_i2c_messages(backend: Backend, rect: UpdateRect, frame: &[u8]) -> Vec<Vec<u8>> {
+    let first_page = rect.y / 8;
+    let pages = rect.height / 8;
+    if backend == Backend::Ssd1306I2c {
+        let mut data = Vec::with_capacity(1 + rect.width * pages);
+        data.push(0x40);
+        for page in first_page..first_page + pages {
+            let start = page * MONO1_FRAME_STRIDE + rect.x;
+            data.extend_from_slice(&frame[start..start + rect.width]);
+        }
+        return vec![ssd1306_address(rect).to_vec(), data];
+    }
+    assert_eq!(backend, Backend::Sh1106I2c);
+    let mut messages = Vec::with_capacity(2 * pages);
+    for page in first_page..first_page + pages {
+        messages.push(sh1106_i2c_range_address(page, rect.x, rect.width).to_vec());
+        let mut data = Vec::with_capacity(1 + rect.width);
+        data.push(0x40);
+        let start = page * MONO1_FRAME_STRIDE + rect.x;
+        data.extend_from_slice(&frame[start..start + rect.width]);
+        messages.push(data);
+    }
+    messages
+}
+
 #[cfg(any(target_os = "linux", test))]
 pub(crate) const SH1106_INIT: &[u8] = &[
     0x00, 0xae, 0x02, 0x10, 0x40, 0x81, 0xa0, 0xa1, 0xc8, 0xa6, 0xa8, 0x3f, 0xd3, 0x00, 0xd5, 0x80,
@@ -421,6 +451,13 @@ pub(crate) fn sh1106_page_address(page: usize, x: usize) -> [u8; 4] {
         (column & 0x0f) as u8,
         0x10 | (column >> 4) as u8,
     ]
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn sh1106_i2c_range_address(page: usize, x: usize, width: usize) -> [u8; 6] {
+    let end = sh1106_page_address(page, x + width - 1);
+    let start = sh1106_page_address(page, x);
+    [0x00, start[1], end[2], end[3], start[2], start[3]]
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -876,3 +913,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "virtual-display-qualification"))]
+#[path = "../tests/qualification/virtual_display.rs"]
+mod virtual_display_tests;
