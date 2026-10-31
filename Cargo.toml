@@ -16,7 +16,7 @@ virtual-display-qualification = []
 demo = ["dep:embedded-graphics"]
 
 [dependencies]
-libc = "0.2.189"
+libc = "0.2.191"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gpiocdev-uapi = "0.7.0"
